@@ -33,6 +33,7 @@ import requests
 import msal
 import pandas as pd
 from openpyxl import Workbook, load_workbook
+from google.cloud import storage, bigquery
 
 # =============================== Configuration ================================
 gv_TENANT_ID      = os.getenv("GRAPH_TENANT_ID", "")
@@ -41,6 +42,16 @@ gv_CLIENT_SECRET  = os.getenv("GRAPH_CLIENT_SECRET", "")
 gv_MASTER_MAILBOX = os.getenv("MASTER_MAILBOX", "territorycheck@strategicfranchising.com")
 gv_OUT_DIR        = os.getenv("OUT_DIR", "/tmp")
 gv_LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+
+# Where to put files in GCS
+gv_GCS_BUCKET          = os.getenv("GCS_BUCKET", "")   # e.g. sfs-territory-raw
+gv_GCS_PREFIX_EXCEL    = os.getenv("GCS_PREFIX_EXCEL", "territory/excel")
+gv_GCS_PREFIX_RAW      = os.getenv("GCS_PREFIX_RAW", "territory/raw")
+
+# Optional BigQuery target for raw CSV
+gv_BQ_PROJECT          = os.getenv("BQ_PROJECT", "")
+gv_BQ_DATASET          = os.getenv("BQ_DATASET", "")
+gv_BQ_TABLE            = os.getenv("BQ_TABLE", "")
 
 gv_COUNT_FORWARDS          = True   # if False, forwards are skipped from counts
 gv_SKIP_REPLIES            = True   # if True, "Re:" thread replies are skipped
@@ -545,7 +556,7 @@ def try_open_workbook(lv_path: str) -> Optional[Workbook]:
         return None
 
 # ================================== Main ======================================
-def run() -> None:
+def run() -> dict:
     # ---- Env validation
     lv_missing = [
         lv_k
@@ -741,29 +752,42 @@ def run() -> None:
         gv_LOG.info(
             "No messages in the window; writing an empty workbook with all brand sheets."
         )
-        _write_workbook(
-            pd.DataFrame(
-                columns=[
-                    "Brand",
-                    "Broker Brand",
-                    "Summary Bucket",
-                    "Others Name",
-                    "Broker Name",
-                    "Territory",
-                    "Received (UTC Date)",
-                    "Subject",
-                    "From",
-                    "Folder",
-                    "Brand Source",
-                    "ConversationId",
-                    "InternetMessageId",
-                ]
-            ),
+        empty_df = pd.DataFrame(
+            columns=[
+                "Brand",
+                "Broker Brand",
+                "Summary Bucket",
+                "Others Name",
+                "Broker Name",
+                "Territory",
+                "Received (UTC Date)",
+                "Subject",
+                "From",
+                "Folder",
+                "Brand Source",
+                "ConversationId",
+                "InternetMessageId",
+            ]
+        )
+        excel_local_path = _write_workbook(
+            empty_df,
             lv_audit_rows,
             lv_week_label,
             lv_file_label,
         )
-        return
+
+        excel_gcs_uri = upload_file_to_gcs(
+            excel_local_path,
+            gv_GCS_PREFIX_EXCEL,
+        )
+
+        return {
+            "excel_local_path": excel_local_path,
+            "excel_gcs_uri": excel_gcs_uri,
+            "raw_local_path": None,
+            "raw_gcs_uri": None,
+        }
+
 
     if "InternetMessageId" in lv_df.columns:
         lv_df = lv_df.sort_values(
@@ -808,7 +832,35 @@ def run() -> None:
         .add(1)
     )
 
-    _write_workbook(lv_df, lv_audit_rows, lv_week_label, lv_file_label)
+    # ---- Write RAW CSV for data lake / BigQuery
+    raw_filename = f"territory_checks_raw_{lv_file_label}.csv"
+    raw_local_path = os.path.join(gv_OUT_DIR, raw_filename)
+    lv_df.to_csv(raw_local_path, index=False)
+    gv_LOG.info("Saved raw CSV: %s", raw_local_path)
+
+    # ---- Write Excel workbook for business users
+    excel_local_path = _write_workbook(
+        lv_df,
+        lv_audit_rows,
+        lv_week_label,
+        lv_file_label,
+    )
+
+    # ---- Upload both to GCS (if configured)
+    raw_gcs_uri = upload_file_to_gcs(raw_local_path, gv_GCS_PREFIX_RAW)
+    excel_gcs_uri = upload_file_to_gcs(excel_local_path, gv_GCS_PREFIX_EXCEL)
+
+    # ---- Load raw into BigQuery (if configured)
+    if raw_gcs_uri:
+        load_raw_to_bigquery(raw_gcs_uri)
+
+    return {
+        "excel_local_path": excel_local_path,
+        "excel_gcs_uri": excel_gcs_uri,
+        "raw_local_path": raw_local_path,
+        "raw_gcs_uri": raw_gcs_uri,
+    }
+
 
 # ------------------------------- Writer ---------------------------------------
 def _write_workbook(
@@ -816,7 +868,7 @@ def _write_workbook(
     lv_audit_rows: List[dict],
     lv_week_label: str,
     lv_file_label: str,
-) -> None:
+) -> str:
     lv_seen_brokers = [
         lv_b
         for lv_b in lv_df.get(
@@ -1067,17 +1119,85 @@ def _write_workbook(
             try:
                 lv_wb.save(lv_alt2)
                 gv_LOG.info("Target locked; saved as: %s", lv_alt2)
+                lv_target_path = lv_alt2          # <<< make sure we return the alt path
                 break
             except PermissionError:
                 lv_j += 1
 
+    return lv_target_path                          # <<< NEW
+
+def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
+    """
+    Upload a local file to GCS.
+    Returns the gs:// URI or None if GCS_BUCKET is not configured.
+    """
+    if not gv_GCS_BUCKET:
+        gv_LOG.info("GCS_BUCKET not set; skipping upload for %s", local_path)
+        return None
+
+    client = storage.Client()
+    bucket = client.bucket(gv_GCS_BUCKET)
+
+    base_name = os.path.basename(local_path)
+    prefix = (prefix or "").strip().strip("/")
+    blob_name = f"{prefix}/{base_name}" if prefix else base_name
+
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+
+    gcs_uri = f"gs://{gv_GCS_BUCKET}/{blob_name}"
+    gv_LOG.info("Uploaded %s to %s", local_path, gcs_uri)
+    return gcs_uri
+
+
+def load_raw_to_bigquery(gcs_uri: str) -> None:
+    """
+    Load the raw CSV at gcs_uri into BigQuery.
+    Autodetects schema, WRITE_APPEND.
+    Skips if BQ_* env vars are not fully set.
+    """
+    if not (gv_BQ_PROJECT and gv_BQ_DATASET and gv_BQ_TABLE):
+        gv_LOG.info(
+            "BQ_PROJECT/BQ_DATASET/BQ_TABLE not fully set; skipping BigQuery load."
+        )
+        return
+
+    table_id = f"{gv_BQ_PROJECT}.{gv_BQ_DATASET}.{gv_BQ_TABLE}"
+    client = bigquery.Client(project=gv_BQ_PROJECT)
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.CSV,
+        skip_leading_rows=1,
+        autodetect=True,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+    )
+
+    gv_LOG.info("Starting BigQuery load from %s to %s", gcs_uri, table_id)
+    load_job = client.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
+    result = load_job.result()  # waits for job completion
+    gv_LOG.info(
+        "BigQuery load complete: %d rows loaded to %s",
+        result.output_rows,
+        table_id,
+    )
+
 # ================================= Entrypoint =================================
-if __name__ == "__main__":
+def main() -> None:
+    gv_LOG.info("Starting Territory Checks ETL job...")
     try:
-        run()
+        result = run()
+        gv_LOG.info("Job finished.")
+        gv_LOG.info("Excel local: %s", result.get("excel_local_path"))
+        gv_LOG.info("Excel GCS  : %s", result.get("excel_gcs_uri"))
+        gv_LOG.info("Raw local  : %s", result.get("raw_local_path"))
+        gv_LOG.info("Raw GCS    : %s", result.get("raw_gcs_uri"))
     except SystemExit as lv_e:
         gv_LOG.error(str(lv_e))
         raise
     except Exception:
         gv_LOG.exception("Unhandled error")
         raise
+
+
+if __name__ == "__main__":
+    main()
