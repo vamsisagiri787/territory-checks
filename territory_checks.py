@@ -2,7 +2,7 @@ from __future__ import annotations
 # ==============================================================================
 #  Author : Vamsi Krishna S. (enterprise build)
 #  Program: Territory Checks – Weekly Brand × Broker Counter (Sun→Sat)
-#  Build  : 2.6 (enterprise, 2025-11-10 with Reply-in-Chat skip)
+#  Build  : 2.7 (enterprise, 2025-11-18 with BigQuery bronze loads)
 #--------------------------------------------------------------
 #  WHAT'S IN THIS BUILD
 #  --------------------
@@ -14,7 +14,11 @@ from __future__ import annotations
 #  • De-dup: Brand × Broker × Territory (keeps first)
 #  • Always creates per-brand sheets even if weekly count is 0
 #  • Unmapped + Audit tabs with helpful columns
-#  • NEW: “Reply in Chat” follow-ups are skipped from counts but visible in Audit
+#  • “Reply in Chat” follow-ups are skipped from counts but visible in Audit
+#  • Writes 3 bronze tables in BigQuery:
+#       - bronze.territory_checks_raw
+#       - bronze.unmapped_territory_checks
+#       - bronze.audit_territory_checks
 #  • No secrets in code (all from env)
 # ==============================================================================
 
@@ -44,20 +48,23 @@ gv_OUT_DIR        = os.getenv("OUT_DIR", "/tmp")
 gv_LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 
 # Where to put files in GCS
-gv_GCS_BUCKET          = os.getenv("GCS_BUCKET", "")   # e.g. sfs-territory-raw
-gv_GCS_PREFIX_EXCEL    = os.getenv("GCS_PREFIX_EXCEL", "territory/excel")
-gv_GCS_PREFIX_RAW      = os.getenv("GCS_PREFIX_RAW", "territory/raw")
+gv_GCS_BUCKET       = os.getenv("GCS_BUCKET", "")   # e.g. sfs-territory-raw
+gv_GCS_PREFIX_EXCEL = os.getenv("GCS_PREFIX_EXCEL", "territory/excel")
+gv_GCS_PREFIX_RAW   = os.getenv("GCS_PREFIX_RAW", "territory/raw")
 
-# Optional BigQuery target for raw CSV
-gv_BQ_PROJECT          = os.getenv("BQ_PROJECT", "")
-gv_BQ_DATASET          = os.getenv("BQ_DATASET", "")
-gv_BQ_TABLE            = os.getenv("BQ_TABLE", "")
+# ---------------- BigQuery config (bronze layer) ----------------
+gv_BQ_PROJECT        = os.getenv("BQ_PROJECT", "sfs-data-lake")
+gv_BQ_DATASET_BRONZE = os.getenv("BQ_DATASET_BRONZE", "bronze")
+
+gv_BQ_TABLE_TERRITORY = os.getenv("BQ_TABLE_TERRITORY", "territory_checks_raw")
+gv_BQ_TABLE_UNMAPPED  = os.getenv("BQ_TABLE_UNMAPPED", "unmapped_territory_checks")
+gv_BQ_TABLE_AUDIT     = os.getenv("BQ_TABLE_AUDIT", "audit_territory_checks")
 
 gv_COUNT_FORWARDS          = True   # if False, forwards are skipped from counts
 gv_SKIP_REPLIES            = True   # if True, "Re:" thread replies are skipped
 gv_SHOW_SUBJECT_IN_DETAILS = True   # show Subject on brand sheets
 
-gv_USER_AGENT   = "TerritoryChecks/2.6"
+gv_USER_AGENT   = "TerritoryChecks/2.7"
 gv_HTTP_TIMEOUT = 60
 gv_MAX_RETRIES  = 5
 
@@ -576,6 +583,8 @@ def run() -> dict:
     lv_start_dt, lv_end_dt, lv_end_excl, lv_week_label, lv_file_label = (
         last_completed_week_utc()
     )
+    lv_run_ts = datetime.now(timezone.utc).replace(microsecond=0)
+
     gv_LOG.info(
         "Processing last completed week: %s → %s (%s)",
         lv_start_dt,
@@ -646,8 +655,8 @@ def run() -> dict:
             lv_brand_source = lv_source1 or lv_source2 or "Unmapped"
 
             # ----- Sender / preview
-            lv_from_obj   = (lv_msg.get("from") or {}).get("emailAddress") or {}
-            lv_sender     = (lv_from_obj.get("address") or "").strip()
+            lv_from_obj    = (lv_msg.get("from") or {}).get("emailAddress") or {}
+            lv_sender      = (lv_from_obj.get("address") or "").strip()
             lv_sender_name = (lv_from_obj.get("name") or "").strip() or lv_sender
 
             # ----- Broker: subject → forwarded header → domain
@@ -722,12 +731,11 @@ def run() -> dict:
                 "ReceivedUTC"           : lv_recv,
                 "FetchedFullBody"       : bool(lv_full_text),
                 "Chosen Broker (bucket)": lv_chosen_broker,
-                "SkippedReason"         : lv_skipped_reason,   # NEW COLUMN
+                "SkippedReason"         : lv_skipped_reason,
             })
 
             # ----- Only add to main details if NOT skipped
             if lv_skipped_reason:
-                # we are done for counts; go to next email
                 continue
 
             lv_details_rows.append({
@@ -783,11 +791,10 @@ def run() -> dict:
 
         return {
             "excel_local_path": excel_local_path,
-            "excel_gcs_uri": excel_gcs_uri,
-            "raw_local_path": None,
-            "raw_gcs_uri": None,
+            "excel_gcs_uri"  : excel_gcs_uri,
+            "raw_local_path" : None,
+            "raw_gcs_uri"    : None,
         }
-
 
     if "InternetMessageId" in lv_df.columns:
         lv_df = lv_df.sort_values(
@@ -832,13 +839,144 @@ def run() -> dict:
         .add(1)
     )
 
-    # ---- Write RAW CSV for data lake / BigQuery
-    raw_filename = f"territory_checks_raw_{lv_file_label}.csv"
-    raw_local_path = os.path.join(gv_OUT_DIR, raw_filename)
-    lv_df.to_csv(raw_local_path, index=False)
-    gv_LOG.info("Saved raw CSV: %s", raw_local_path)
+    # ==================== BigQuery bronze DataFrames ====================
+    # 1) territory_checks_raw  (non-skipped, de-duplicated rows used for counts)
+    df_territory = lv_df.copy()
+    df_territory["run_date_from"] = lv_start_dt.date()
+    df_territory["run_date_to"]   = lv_end_dt.date()
+    df_territory["run_timestamp"] = lv_run_ts
 
-    # ---- Write Excel workbook for business users
+    df_territory = df_territory.rename(
+        columns={
+            "Brand"              : "brand_name",
+            "Broker Brand"       : "broker_brand",
+            "Broker Name"        : "broker_name",
+            "Territory"          : "territory",
+            "Received (UTC Date)": "received_utc",
+            "Seq"                : "seq",
+            "Subject"            : "subject",
+        }
+    )
+
+    df_territory = df_territory[
+        [
+            "brand_name",
+            "broker_brand",
+            "broker_name",
+            "territory",
+            "received_utc",
+            "seq",
+            "subject",
+            "run_date_from",
+            "run_date_to",
+            "run_timestamp",
+        ]
+    ]
+
+    # 2) unmapped_territory_checks  (only rows where brand was Unmapped)
+    df_unmapped = lv_df[lv_df["Brand"] == "Unmapped"].copy()
+    df_unmapped["run_date_from"] = lv_start_dt.date()
+    df_unmapped["run_date_to"]   = lv_end_dt.date()
+    df_unmapped["run_timestamp"] = lv_run_ts
+
+    df_unmapped = df_unmapped.rename(
+        columns={
+            "Brand"              : "brand_name",
+            "Brand Source"       : "brand_source",
+            "Broker Brand"       : "broker_brand",
+            "Broker Name"        : "broker_name",
+            "Territory"          : "territory",
+            "Received (UTC Date)": "received_utc",
+            "Subject"            : "subject",
+            "From"               : "from_email",
+            "Folder"             : "folder_name",
+        }
+    )
+
+    df_unmapped = df_unmapped[
+        [
+            "brand_name",
+            "brand_source",
+            "broker_brand",
+            "broker_name",
+            "territory",
+            "received_utc",
+            "subject",
+            "from_email",
+            "folder_name",
+            "run_date_from",
+            "run_date_to",
+            "run_timestamp",
+        ]
+    ]
+
+    # 3) audit_territory_checks  (ALL emails, including skipped)
+    df_audit = pd.DataFrame(lv_audit_rows)
+    if not df_audit.empty:
+        df_audit["run_date_from"] = lv_start_dt.date()
+        df_audit["run_date_to"]   = lv_end_dt.date()
+        df_audit["run_timestamp"] = lv_run_ts
+
+        df_audit = df_audit.rename(
+            columns={
+                "Folder"                : "folder_name",
+                "Brand"                 : "brand_name",
+                "Brand Source"          : "brand_source",
+                "IsForward"             : "is_forward",
+                "IsReply"               : "is_reply",
+                "Subject"               : "subject",
+                "From"                  : "from_email",
+                "To"                    : "to_email",
+                "CC"                    : "cc_email",
+                "BCC"                   : "bcc_email",
+                "BodyPreview"           : "body_preview",
+                "ReceivedUTC"           : "received_utc",
+                "FetchedFullBody"       : "fetched_full_body",
+                "Chosen Broker (bucket)": "chosen_broker",
+                # SkippedReason stays in Excel only
+            }
+        )
+
+        df_audit = df_audit[
+            [
+                "folder_name",
+                "brand_name",
+                "brand_source",
+                "is_forward",
+                "is_reply",
+                "subject",
+                "from_email",
+                "to_email",
+                "cc_email",
+                "bcc_email",
+                "body_preview",
+                "received_utc",
+                "fetched_full_body",
+                "chosen_broker",
+                "run_date_from",
+                "run_date_to",
+                "run_timestamp",
+            ]
+        ]
+
+    # ==================== Save CSVs for GCS / BigQuery ====================
+    raw_filename      = f"territory_checks_raw_{lv_file_label}.csv"
+    raw_unmapped_file = f"territory_unmapped_{lv_file_label}.csv"
+    audit_filename    = f"territory_audit_{lv_file_label}.csv"
+
+    raw_local_path      = os.path.join(gv_OUT_DIR, raw_filename)
+    unmapped_local_path = os.path.join(gv_OUT_DIR, raw_unmapped_file)
+    audit_local_path    = os.path.join(gv_OUT_DIR, audit_filename)
+
+    df_territory.to_csv(raw_local_path, index=False)
+    df_unmapped.to_csv(unmapped_local_path, index=False)
+    if not df_audit.empty:
+        df_audit.to_csv(audit_local_path, index=False)
+
+    gv_LOG.info("Saved CSVs for BigQuery: %s, %s, %s",
+                raw_local_path, unmapped_local_path, audit_local_path)
+
+    # ---- Write Excel workbook for business users (uses lv_df + lv_audit_rows)
     excel_local_path = _write_workbook(
         lv_df,
         lv_audit_rows,
@@ -846,21 +984,38 @@ def run() -> dict:
         lv_file_label,
     )
 
-    # ---- Upload both to GCS (if configured)
-    raw_gcs_uri = upload_file_to_gcs(raw_local_path, gv_GCS_PREFIX_RAW)
-    excel_gcs_uri = upload_file_to_gcs(excel_local_path, gv_GCS_PREFIX_EXCEL)
+    # ---- Upload all files to GCS (if configured)
+    raw_gcs_uri      = upload_file_to_gcs(raw_local_path,      gv_GCS_PREFIX_RAW + "/territory")
+    unmapped_gcs_uri = upload_file_to_gcs(unmapped_local_path, gv_GCS_PREFIX_RAW + "/unmapped")
+    audit_gcs_uri    = upload_file_to_gcs(audit_local_path,    gv_GCS_PREFIX_RAW + "/audit")
+    excel_gcs_uri    = upload_file_to_gcs(excel_local_path,    gv_GCS_PREFIX_EXCEL)
 
-    # ---- Load raw into BigQuery (if configured)
+    # ---- Load into BigQuery bronze (if configured)
     if raw_gcs_uri:
-        load_raw_to_bigquery(raw_gcs_uri)
+        load_csv_to_bigquery(
+            raw_gcs_uri,
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_TERRITORY,
+        )
+    if unmapped_gcs_uri:
+        load_csv_to_bigquery(
+            unmapped_gcs_uri,
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_UNMAPPED,
+        )
+    if audit_gcs_uri:
+        load_csv_to_bigquery(
+            audit_gcs_uri,
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_AUDIT,
+        )
 
     return {
         "excel_local_path": excel_local_path,
-        "excel_gcs_uri": excel_gcs_uri,
-        "raw_local_path": raw_local_path,
-        "raw_gcs_uri": raw_gcs_uri,
+        "excel_gcs_uri"   : excel_gcs_uri,
+        "raw_local_path"  : raw_local_path,
+        "raw_gcs_uri"     : raw_gcs_uri,
     }
-
 
 # ------------------------------- Writer ---------------------------------------
 def _write_workbook(
@@ -1095,7 +1250,7 @@ def _write_workbook(
         "ReceivedUTC",
         "FetchedFullBody",
         "Chosen Broker (bucket)",
-        "SkippedReason",      # NEW AUDIT COLUMN
+        "SkippedReason",
     ]
     lv_ws_a.append(lv_cols_a)
     for lv_row in lv_audit_rows:
@@ -1119,12 +1274,12 @@ def _write_workbook(
             try:
                 lv_wb.save(lv_alt2)
                 gv_LOG.info("Target locked; saved as: %s", lv_alt2)
-                lv_target_path = lv_alt2          # <<< make sure we return the alt path
+                lv_target_path = lv_alt2
                 break
             except PermissionError:
                 lv_j += 1
 
-    return lv_target_path                          # <<< NEW
+    return lv_target_path
 
 def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
     """
@@ -1149,32 +1304,28 @@ def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
     gv_LOG.info("Uploaded %s to %s", local_path, gcs_uri)
     return gcs_uri
 
-
-def load_raw_to_bigquery(gcs_uri: str) -> None:
+def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     """
-    Load the raw CSV at gcs_uri into BigQuery.
-    Autodetects schema, WRITE_APPEND.
-    Skips if BQ_* env vars are not fully set.
+    Load a CSV at gcs_uri into BigQuery (WRITE_APPEND).
+    Skips if BQ_PROJECT is not set.
     """
-    if not (gv_BQ_PROJECT and gv_BQ_DATASET and gv_BQ_TABLE):
-        gv_LOG.info(
-            "BQ_PROJECT/BQ_DATASET/BQ_TABLE not fully set; skipping BigQuery load."
-        )
+    if not gv_BQ_PROJECT:
+        gv_LOG.info("BQ_PROJECT not set; skipping BigQuery load for %s", gcs_uri)
         return
 
-    table_id = f"{gv_BQ_PROJECT}.{gv_BQ_DATASET}.{gv_BQ_TABLE}"
+    table_id = f"{gv_BQ_PROJECT}.{dataset}.{table}"
     client = bigquery.Client(project=gv_BQ_PROJECT)
 
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        autodetect=True,
+        autodetect=False,  # schema created via bq mk
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
 
     gv_LOG.info("Starting BigQuery load from %s to %s", gcs_uri, table_id)
     load_job = client.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
-    result = load_job.result()  # waits for job completion
+    result = load_job.result()
     gv_LOG.info(
         "BigQuery load complete: %d rows loaded to %s",
         result.output_rows,
@@ -1197,7 +1348,6 @@ def main() -> None:
     except Exception:
         gv_LOG.exception("Unhandled error")
         raise
-
 
 if __name__ == "__main__":
     main()
