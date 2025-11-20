@@ -30,6 +30,8 @@ import json
 import logging
 import unicodedata
 import html
+import csv
+
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Tuple, Optional
 
@@ -960,6 +962,7 @@ def run() -> dict:
         ]
 
     # ==================== Save CSVs for GCS / BigQuery ====================
+
     raw_filename      = f"territory_checks_raw_{lv_file_label}.csv"
     raw_unmapped_file = f"territory_unmapped_{lv_file_label}.csv"
     audit_filename    = f"territory_audit_{lv_file_label}.csv"
@@ -968,13 +971,50 @@ def run() -> dict:
     unmapped_local_path = os.path.join(gv_OUT_DIR, raw_unmapped_file)
     audit_local_path    = os.path.join(gv_OUT_DIR, audit_filename)
 
-    df_territory.to_csv(raw_local_path, index=False)
-    df_unmapped.to_csv(unmapped_local_path, index=False)
-    if not df_audit.empty:
-        df_audit.to_csv(audit_local_path, index=False)
+    # ---- Normalize received_utc to full timestamps for BigQuery ----
+    common_date_format = "%Y-%m-%d %H:%M:%S"
 
-    gv_LOG.info("Saved CSVs for BigQuery: %s, %s, %s",
-                raw_local_path, unmapped_local_path, audit_local_path)
+    for df in (df_territory, df_unmapped, df_audit):
+        if df is not None and not df.empty and "received_utc" in df.columns:
+            df["received_utc"] = pd.to_datetime(
+                df["received_utc"],
+                errors="coerce",
+            )
+
+    # ---- Territory + Unmapped: normal CSV with date_format ----
+    df_territory.to_csv(
+        raw_local_path,
+        index=False,
+        date_format=common_date_format,
+    )
+
+    df_unmapped.to_csv(
+        unmapped_local_path,
+        index=False,
+        date_format=common_date_format,
+    )
+
+    # ---- Audit: special handling (quotes + clean run_timestamp) ----
+    if not df_audit.empty:
+        if "run_timestamp" in df_audit.columns:
+            df_audit["run_timestamp"] = (
+                pd.to_datetime(df_audit["run_timestamp"], errors="coerce")
+                  .dt.strftime(common_date_format)
+            )
+
+        df_audit.to_csv(
+            audit_local_path,
+            index=False,
+            quoting=csv.QUOTE_ALL,   # important: handles commas/newlines
+            lineterminator="\n",
+        )
+
+    gv_LOG.info(
+        "Saved CSVs for BigQuery: %s, %s, %s",
+        raw_local_path,
+        unmapped_local_path,
+        audit_local_path,
+    )
 
     # ---- Write Excel workbook for business users (uses lv_df + lv_audit_rows)
     excel_local_path = _write_workbook(
@@ -1306,8 +1346,7 @@ def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
 
 def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     """
-    Load a CSV at gcs_uri into BigQuery (WRITE_APPEND).
-    Skips if BQ_PROJECT is not set.
+    Load a CSV at gcs_uri into BigQuery.
     """
     if not gv_BQ_PROJECT:
         gv_LOG.info("BQ_PROJECT not set; skipping BigQuery load for %s", gcs_uri)
@@ -1319,8 +1358,12 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        autodetect=False,  # schema created via bq mk
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        autodetect=False,  # schema already created
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,  # or APPEND later
+        allow_quoted_newlines=True,   
+        field_delimiter=",",
+        encoding="UTF-8",
+        max_bad_records=0,
     )
 
     gv_LOG.info("Starting BigQuery load from %s to %s", gcs_uri, table_id)
@@ -1331,6 +1374,7 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
         result.output_rows,
         table_id,
     )
+
 
 # ================================= Entrypoint =================================
 def main() -> None:
