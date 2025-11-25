@@ -1359,7 +1359,7 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
         autodetect=False,  # schema already created
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,  # or APPEND later
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,  # or APPEND later
         allow_quoted_newlines=True,   
         field_delimiter=",",
         encoding="UTF-8",
