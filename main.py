@@ -2,11 +2,13 @@ from __future__ import annotations
 # ==============================================================================
 #  Author : Vamsi Krishna S. (enterprise build)
 #  Program: Territory Checks – Weekly Brand × Broker Counter (Sun→Sat)
-#  Build  : 2.7 (enterprise, 2025-11-18 with BigQuery bronze loads)
+#  Build  : 2.9 (2025-11-18 with BigQuery bronze loads + week param + idempotent)
 #--------------------------------------------------------------
 #  WHAT'S IN THIS BUILD
 #  --------------------
-#  • Week window = previous Sun 00:00:00 → this Sun 00:00:00 (UTC, exclusive)
+#  • Week window:
+#       - Default: previous Sun 00:00:00 → this Sun 00:00:00 (UTC, exclusive)
+#       - Override: --week_end=YYYY-MM-DD (Sunday UTC) → uses that Sunday
 #  • Brand detection prefers To/Cc/Bcc, then routing headers only (no noise)
 #  • Growth Coach alias includes growthcoach.com
 #  • Broker detection: subject → forwarded body header → sender domain
@@ -19,7 +21,8 @@ from __future__ import annotations
 #       - bronze.territory_checks_raw
 #       - bronze.unmapped_territory_checks
 #       - bronze.audit_territory_checks
-#  • No secrets in code (all from env)
+#  • NEW: Optional CLI arg --week_end=YYYY-MM-DD to backfill any specific week
+#  • NEW: Idempotent BigQuery loads via delete+append per (run_date_from, run_date_to)
 # ==============================================================================
 
 # ================================= Imports ====================================
@@ -31,8 +34,9 @@ import logging
 import unicodedata
 import html
 import csv
+import argparse  # NEW: for CLI / Cloud Run Job parameters
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Iterable, List, Tuple, Optional
 
 import requests
@@ -66,7 +70,7 @@ gv_COUNT_FORWARDS          = True   # if False, forwards are skipped from counts
 gv_SKIP_REPLIES            = True   # if True, "Re:" thread replies are skipped
 gv_SHOW_SUBJECT_IN_DETAILS = True   # show Subject on brand sheets
 
-gv_USER_AGENT   = "TerritoryChecks/2.7"
+gv_USER_AGENT   = "TerritoryChecks/2.9"
 gv_HTTP_TIMEOUT = 60
 gv_MAX_RETRIES  = 5
 
@@ -151,6 +155,9 @@ def last_completed_week_utc(
       start (inclusive)  = previous Sun 00:00:00
       end_exclusive      = this    Sun 00:00:00
       end_inclusive      = this    Sat 23:59:59 (labels only)
+
+    Returns:
+      (start_inclusive, end_inclusive, end_exclusive, week_label, file_label)
     """
     lv_now = lv_now_utc or datetime.now(timezone.utc).replace(microsecond=0)
     lv_days_since_sun = (lv_now.weekday() + 1) % 7
@@ -167,6 +174,41 @@ def last_completed_week_utc(
     lv_week_label = f"{lv_start:%m.%d}-{lv_end_inclusive:%m.%d.%y}"
     lv_file_label = f"{lv_end_inclusive:%Y-%m-%d}"
     return lv_start, lv_end_inclusive, lv_end_exclusive, lv_week_label, lv_file_label
+
+
+def compute_week_window(
+    lv_override_week_end_str: Optional[str] = None,
+) -> Tuple[datetime, datetime, datetime, str, str]:
+    """
+    Compute the reporting week window.
+
+    If lv_override_week_end_str is provided (YYYY-MM-DD, UTC, Sunday),
+    we treat that date as the "end Sunday" and compute:
+      start (inclusive)  = end_sunday - 7 days at 00:00:00
+      end_exclusive      = end_sunday at 00:00:00
+      end_inclusive      = end_sunday - 1 second
+
+    If it's not provided, we fall back to last_completed_week_utc(), which
+    uses "now" to figure out the last fully completed week.
+
+    Returns:
+      (start_inclusive, end_inclusive, end_exclusive, week_label, file_label)
+    """
+    if lv_override_week_end_str:
+        lv_end_sun = datetime.strptime(
+            lv_override_week_end_str, "%Y-%m-%d"
+        ).replace(tzinfo=timezone.utc, hour=0, minute=0, second=0, microsecond=0)
+
+        lv_start = lv_end_sun - timedelta(days=7)
+        lv_end_exclusive = lv_end_sun
+        lv_end_inclusive = lv_end_sun - timedelta(seconds=1)
+
+        lv_week_label = f"{lv_start:%m.%d}-{lv_end_inclusive:%m.%d.%y}"
+        lv_file_label = f"{lv_end_inclusive:%Y-%m-%d}"
+
+        return lv_start, lv_end_inclusive, lv_end_exclusive, lv_week_label, lv_file_label
+
+    return last_completed_week_utc()
 
 # ================================ Graph Client ================================
 class GraphClient:
@@ -249,7 +291,6 @@ class GraphClient:
             lv_resp.raise_for_status()
             return lv_resp
 
-        # if we exhausted retries
         lv_resp.raise_for_status()
         return lv_resp
 
@@ -329,10 +370,6 @@ def is_forward(lv_s: str) -> bool:
     return bool(gv_FW_PREFIX.match(lv_s or ""))
 
 def is_reply_in_chat(lv_subject: str, lv_body_preview: str) -> bool:
-    """
-    Treat 'Reply in Chat ...' notifications as follow-up emails.
-    We check both Subject and BodyPreview for safety.
-    """
     lv_combined = f"{lv_subject or ''} {lv_body_preview or ''}"
     return bool(gv_RE_REPLY_IN_CHAT.search(lv_combined))
 
@@ -343,6 +380,10 @@ def _norm(lv_text: str) -> str:
     return lv_s
 
 def _html_to_text(lv_html_str: str) -> str:
+    """
+    Convert HTML into a plain text-ish string, stripping scripts/styles and tags.
+    Used when we fetch the full Outlook body.
+    """
     if not lv_html_str:
         return ""
     lv_txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", lv_html_str)
@@ -352,6 +393,7 @@ def _html_to_text(lv_html_str: str) -> str:
     lv_txt = html.unescape(lv_txt)
     lv_txt = re.sub(r"\r", "\n", lv_txt)
     return re.sub(r"[ \t]+", " ", lv_txt)
+
 
 def _addr_list(*lv_lists: List[dict] | None) -> List[str]:
     lv_addrs: List[str] = []
@@ -564,8 +606,71 @@ def try_open_workbook(lv_path: str) -> Optional[Workbook]:
     except PermissionError:
         return None
 
+# ============================ BigQuery helpers ================================
+def bq_client() -> bigquery.Client:
+    return bigquery.Client(project=gv_BQ_PROJECT) if gv_BQ_PROJECT else bigquery.Client()
+
+def delete_week_slice(
+    dataset: str,
+    table: str,
+    run_date_from: date,
+    run_date_to: date,
+) -> None:
+    """
+    Idempotency helper: delete the existing slice for a given week
+    from the specified bronze table before appending fresh data.
+
+    We key the slice by (run_date_from, run_date_to).
+    """
+    if not gv_BQ_PROJECT:
+        gv_LOG.info(
+            "BQ_PROJECT not set; skipping delete-week-slice for %s.%s",
+            dataset,
+            table,
+        )
+        return
+
+    table_id = f"{gv_BQ_PROJECT}.{dataset}.{table}"
+    client = bq_client()
+
+    sql = f"""
+        DELETE FROM `{table_id}`
+        WHERE run_date_from = @from_date
+          AND run_date_to   = @to_date
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("from_date", "DATE", run_date_from),
+            bigquery.ScalarQueryParameter("to_date",   "DATE", run_date_to),
+        ]
+    )
+
+    gv_LOG.info(
+        "Deleting existing week slice from %s for run_date_from=%s, run_date_to=%s",
+        table_id,
+        run_date_from,
+        run_date_to,
+    )
+    job = client.query(sql, job_config=job_config)
+    res = job.result()
+    gv_LOG.info(
+        "Deleted %s rows from %s for the given week slice.",
+        res.num_dml_affected_rows,
+        table_id,
+    )
+
 # ================================== Main ======================================
-def run() -> dict:
+def run(lv_override_week_end_str: Optional[str] = None) -> dict:
+    """
+    Main ETL run.
+
+    :param lv_override_week_end_str:
+        Optional override for the reporting week end date, as YYYY-MM-DD (UTC).
+        - If provided, we process the week ending on that Sunday
+          (Sun 00:00:00 exclusive, previous Sun 00:00:00 inclusive).
+        - If not provided, we process the last fully completed week based on "now".
+    """
     # ---- Env validation
     lv_missing = [
         lv_k
@@ -582,16 +687,22 @@ def run() -> dict:
         raise SystemExit("Missing environment variables: " + ", ".join(lv_missing))
 
     ensure_out_dir()
+
+    # Compute the week window (default or override)
     lv_start_dt, lv_end_dt, lv_end_excl, lv_week_label, lv_file_label = (
-        last_completed_week_utc()
+        compute_week_window(lv_override_week_end_str)
     )
     lv_run_ts = datetime.now(timezone.utc).replace(microsecond=0)
 
+    lv_run_date_from = lv_start_dt.date()
+    lv_run_date_to   = lv_end_dt.date()
+
     gv_LOG.info(
-        "Processing last completed week: %s → %s (%s)",
+        "Processing week window: %s → %s (%s) [end_exclusive=%s]",
         lv_start_dt,
         lv_end_dt,
         lv_week_label,
+        lv_end_excl,
     )
 
     lv_client = GraphClient(
@@ -629,13 +740,10 @@ def run() -> dict:
             # --- Decide skip reason (but DO NOT drop from Audit)
             lv_skipped_reason = ""
 
-            # 1) Explicit "Reply in Chat" follow-ups from brokers
             if is_reply_in_chat(lv_subj, lv_body_preview):
                 lv_skipped_reason = "Reply in Chat"
-            # 2) Normal replies (Re:) if configured to skip
             elif gv_SKIP_REPLIES and lv_is_reply:
                 lv_skipped_reason = "Reply"
-            # 3) Forwards if counting is turned off
             elif (not gv_COUNT_FORWARDS) and lv_is_forward:
                 lv_skipped_reason = "Forward (disabled)"
 
@@ -736,7 +844,6 @@ def run() -> dict:
                 "SkippedReason"         : lv_skipped_reason,
             })
 
-            # ----- Only add to main details if NOT skipped
             if lv_skipped_reason:
                 continue
 
@@ -807,7 +914,6 @@ def run() -> dict:
             keep="first",
         )
 
-    # ---- De-duplicate by Brand+Broker+Territory (when territory known)
     def _canon_terr(lv_x: str) -> str:
         lv_s = _norm(lv_x or "")
         lv_s = re.sub(r"[^a-z0-9 ,.'\-]", " ", lv_s)
@@ -826,7 +932,6 @@ def run() -> dict:
         ignore_index=True,
     )
 
-    # ---- Sort & sequence
     lv_df["Received (UTC Date)"] = pd.to_datetime(
         lv_df["Received (UTC Date)"],
         errors="coerce",
@@ -842,10 +947,10 @@ def run() -> dict:
     )
 
     # ==================== BigQuery bronze DataFrames ====================
-    # 1) territory_checks_raw  (non-skipped, de-duplicated rows used for counts)
+    # 1) territory_checks_raw
     df_territory = lv_df.copy()
-    df_territory["run_date_from"] = lv_start_dt.date()
-    df_territory["run_date_to"]   = lv_end_dt.date()
+    df_territory["run_date_from"] = lv_run_date_from
+    df_territory["run_date_to"]   = lv_run_date_to
     df_territory["run_timestamp"] = lv_run_ts
 
     df_territory = df_territory.rename(
@@ -875,10 +980,10 @@ def run() -> dict:
         ]
     ]
 
-    # 2) unmapped_territory_checks  (only rows where brand was Unmapped)
+    # 2) unmapped_territory_checks
     df_unmapped = lv_df[lv_df["Brand"] == "Unmapped"].copy()
-    df_unmapped["run_date_from"] = lv_start_dt.date()
-    df_unmapped["run_date_to"]   = lv_end_dt.date()
+    df_unmapped["run_date_from"] = lv_run_date_from
+    df_unmapped["run_date_to"]   = lv_run_date_to
     df_unmapped["run_timestamp"] = lv_run_ts
 
     df_unmapped = df_unmapped.rename(
@@ -912,11 +1017,11 @@ def run() -> dict:
         ]
     ]
 
-    # 3) audit_territory_checks  (ALL emails, including skipped)
+    # 3) audit_territory_checks
     df_audit = pd.DataFrame(lv_audit_rows)
     if not df_audit.empty:
-        df_audit["run_date_from"] = lv_start_dt.date()
-        df_audit["run_date_to"]   = lv_end_dt.date()
+        df_audit["run_date_from"] = lv_run_date_from
+        df_audit["run_date_to"]   = lv_run_date_to
         df_audit["run_timestamp"] = lv_run_ts
 
         df_audit = df_audit.rename(
@@ -935,7 +1040,6 @@ def run() -> dict:
                 "ReceivedUTC"           : "received_utc",
                 "FetchedFullBody"       : "fetched_full_body",
                 "Chosen Broker (bucket)": "chosen_broker",
-                # SkippedReason stays in Excel only
             }
         )
 
@@ -971,7 +1075,6 @@ def run() -> dict:
     unmapped_local_path = os.path.join(gv_OUT_DIR, raw_unmapped_file)
     audit_local_path    = os.path.join(gv_OUT_DIR, audit_filename)
 
-    # ---- Normalize received_utc to full timestamps for BigQuery ----
     common_date_format = "%Y-%m-%d %H:%M:%S"
 
     for df in (df_territory, df_unmapped, df_audit):
@@ -981,7 +1084,6 @@ def run() -> dict:
                 errors="coerce",
             )
 
-    # ---- Territory + Unmapped: normal CSV with date_format ----
     df_territory.to_csv(
         raw_local_path,
         index=False,
@@ -994,7 +1096,6 @@ def run() -> dict:
         date_format=common_date_format,
     )
 
-    # ---- Audit: special handling (quotes + clean run_timestamp) ----
     if not df_audit.empty:
         if "run_timestamp" in df_audit.columns:
             df_audit["run_timestamp"] = (
@@ -1005,7 +1106,7 @@ def run() -> dict:
         df_audit.to_csv(
             audit_local_path,
             index=False,
-            quoting=csv.QUOTE_ALL,   # important: handles commas/newlines
+            quoting=csv.QUOTE_ALL,
             lineterminator="\n",
         )
 
@@ -1016,7 +1117,6 @@ def run() -> dict:
         audit_local_path,
     )
 
-    # ---- Write Excel workbook for business users (uses lv_df + lv_audit_rows)
     excel_local_path = _write_workbook(
         lv_df,
         lv_audit_rows,
@@ -1024,26 +1124,43 @@ def run() -> dict:
         lv_file_label,
     )
 
-    # ---- Upload all files to GCS (if configured)
     raw_gcs_uri      = upload_file_to_gcs(raw_local_path,      gv_GCS_PREFIX_RAW + "/territory")
     unmapped_gcs_uri = upload_file_to_gcs(unmapped_local_path, gv_GCS_PREFIX_RAW + "/unmapped")
     audit_gcs_uri    = upload_file_to_gcs(audit_local_path,    gv_GCS_PREFIX_RAW + "/audit")
     excel_gcs_uri    = upload_file_to_gcs(excel_local_path,    gv_GCS_PREFIX_EXCEL)
 
-    # ---- Load into BigQuery bronze (if configured)
+    # ---- Idempotent bronze loads: delete slice for this week, then append ----
     if raw_gcs_uri:
+        delete_week_slice(
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_TERRITORY,
+            lv_run_date_from,
+            lv_run_date_to,
+        )
         load_csv_to_bigquery(
             raw_gcs_uri,
             gv_BQ_DATASET_BRONZE,
             gv_BQ_TABLE_TERRITORY,
         )
     if unmapped_gcs_uri:
+        delete_week_slice(
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_UNMAPPED,
+            lv_run_date_from,
+            lv_run_date_to,
+        )
         load_csv_to_bigquery(
             unmapped_gcs_uri,
             gv_BQ_DATASET_BRONZE,
             gv_BQ_TABLE_UNMAPPED,
         )
     if audit_gcs_uri:
+        delete_week_slice(
+            gv_BQ_DATASET_BRONZE,
+            gv_BQ_TABLE_AUDIT,
+            lv_run_date_from,
+            lv_run_date_to,
+        )
         load_csv_to_bigquery(
             audit_gcs_uri,
             gv_BQ_DATASET_BRONZE,
@@ -1091,7 +1208,6 @@ def _write_workbook(
                 break
             lv_i += 1
 
-    # ---- Per-brand data sheets
     if not lv_df.empty:
         for lv_brand, lv_sub in lv_df.groupby("Brand"):
             lv_sheet_name = lv_brand
@@ -1126,7 +1242,6 @@ def _write_workbook(
             for _, lv_r in lv_sub_out.iterrows():
                 lv_ws.append([lv_r[lv_c] for lv_c in lv_cols_detail])
 
-            # Summary (start at G)
             lv_col_base = 7
             lv_summary = (
                 lv_sub.groupby("Summary Bucket")
@@ -1166,7 +1281,6 @@ def _write_workbook(
                     value=int(lv_row["Count"]),
                 )
 
-            # Others breakdown (below)
             lv_others_sub = lv_sub[lv_sub["Summary Bucket"] == "Others"]
             if not lv_others_sub.empty:
                 lv_breakdown = (
@@ -1214,7 +1328,6 @@ def _write_workbook(
                         value=int(lv_row["Count"]),
                     )
 
-    # ---- Ensure every brand has a sheet, even with 0 rows
     lv_cols_detail = [
         "Broker Brand",
         "Broker Name",
@@ -1237,7 +1350,7 @@ def _write_workbook(
             lv_ws.cell(row=1, column=lv_col_base+1, value=lv_week_label)
             for lv_i, lv_b in enumerate(lv_broker_order_full, start=2):
                 lv_ws.cell(row=lv_i, column=lv_col_base,   value=lv_b)
-                lv_ws.cell(row=lv_i, column=lv_col_base+1, value=0)
+                lv_ws.cell(row=lv_i, column=lv_col_base + 1, value=0)
             lv_ws.cell(
                 row=len(lv_broker_order_full) + 2,
                 column=lv_col_base,
@@ -1249,7 +1362,6 @@ def _write_workbook(
                 value=0,
             )
 
-    # ---- Unmapped
     if "Unmapped" not in lv_wb.sheetnames:
         lv_wb.create_sheet("Unmapped")
     lv_ws_u = lv_wb["Unmapped"]
@@ -1270,7 +1382,6 @@ def _write_workbook(
         for _, lv_r in lv_df[lv_df["Brand"] == "Unmapped"][lv_cols_u].iterrows():
             lv_ws_u.append([lv_r.get(lv_c, "") for lv_c in lv_cols_u])
 
-    # ---- Audit
     if "Audit" not in lv_wb.sheetnames:
         lv_wb.create_sheet("Audit")
     lv_ws_a = lv_wb["Audit"]
@@ -1296,11 +1407,9 @@ def _write_workbook(
     for lv_row in lv_audit_rows:
         lv_ws_a.append([lv_row.get(lv_c, "") for lv_c in lv_cols_a])
 
-    # ---- Remove placeholder
     if "Index" in lv_wb.sheetnames and len(lv_wb.sheetnames) > 1:
         del lv_wb["Index"]
 
-    # ---- Save (lock-safe)
     try:
         lv_wb.save(lv_target_path)
         gv_LOG.info("Saved weekly workbook: %s", lv_target_path)
@@ -1346,7 +1455,8 @@ def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
 
 def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     """
-    Load a CSV at gcs_uri into BigQuery.
+    Load a CSV at gcs_uri into BigQuery (WRITE_APPEND).
+    Idempotency is enforced by delete_week_slice() before calling this.
     """
     if not gv_BQ_PROJECT:
         gv_LOG.info("BQ_PROJECT not set; skipping BigQuery load for %s", gcs_uri)
@@ -1358,9 +1468,9 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        autodetect=False,  # schema already created
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,  # or APPEND later
-        allow_quoted_newlines=True,   
+        autodetect=False,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        allow_quoted_newlines=True,
         field_delimiter=",",
         encoding="UTF-8",
         max_bad_records=0,
@@ -1375,12 +1485,50 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
         table_id,
     )
 
-
 # ================================= Entrypoint =================================
 def main() -> None:
-    gv_LOG.info("Starting Territory Checks ETL job...")
+    """
+    Entrypoint for the container / Cloud Run Job.
+
+    Behavior:
+      - Default: no arguments → process the last completed week (Sun→Sat).
+      - Optional: --week_end=YYYY-MM-DD → process the week ending on that
+        Sunday in UTC (Sun 00:00:00 exclusive, previous Sun 00:00:00 inclusive).
+    """
+    lv_parser = argparse.ArgumentParser(
+        description="Territory Checks weekly ETL",
+        add_help=True,
+    )
+    lv_parser.add_argument(
+        "--week_end",
+        dest="week_end",
+        type=str,
+        required=False,
+        help=(
+            "Optional override for week end date in UTC, "
+            "format YYYY-MM-DD (expected to be a Sunday). "
+            "If omitted, the last completed week based on 'now' is used."
+        ),
+    )
+
+    # IMPORTANT: be tolerant of extra args that Cloud Run / Docker might pass
+    lv_args, lv_unknown = lv_parser.parse_known_args()
+    if lv_unknown:
+        gv_LOG.info("Ignoring unknown CLI args (likely from platform): %s", lv_unknown)
+
+
+    if lv_args.week_end:
+        gv_LOG.info(
+            "Starting Territory Checks ETL job for explicit week_end=%s",
+            lv_args.week_end,
+        )
+    else:
+        gv_LOG.info(
+            "Starting Territory Checks ETL job for last completed week (no override)."
+        )
+
     try:
-        result = run()
+        result = run(lv_override_week_end_str=lv_args.week_end)
         gv_LOG.info("Job finished.")
         gv_LOG.info("Excel local: %s", result.get("excel_local_path"))
         gv_LOG.info("Excel GCS  : %s", result.get("excel_gcs_uri"))
