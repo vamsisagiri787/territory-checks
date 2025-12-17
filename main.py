@@ -2,8 +2,8 @@ from __future__ import annotations
 # ==============================================================================
 #  Author : Vamsi Krishna S. (enterprise build)
 #  Program: Territory Checks – Weekly Brand × Broker Counter (Sun→Sat)
-#  Build  : 3.0 (2025-11-29 with BigQuery bronze loads + week param + idempotent)
-#--------------------------------------------------------------
+#  Build  : 3.1 (2025-11-29 + broker-master lookup)
+#------------------------------------------------------------------------------
 #  WHAT'S IN THIS BUILD
 #  --------------------
 #  • Week window:
@@ -12,7 +12,8 @@ from __future__ import annotations
 #  • Brand detection prefers To/Cc/Bcc, then routing headers only (no noise)
 #  • Growth Coach alias includes growthcoach.com
 #  • Broker detection: subject → forwarded header text → sender domain
-#  • NEW: If broker is still "Others", scan full HTML body for broker domains
+#  • If broker is still "Others", scan full HTML body for broker domains
+#  • NEW: If still "Others", look up broker in brand-specific broker-master XLS
 #  • Territory: subject → bodyPreview → full HTML body (fallback)
 #  • De-dup: Brand × Broker × Territory (keeps first)
 #  • Always creates per-brand sheets even if weekly count is 0
@@ -24,10 +25,16 @@ from __future__ import annotations
 #       - bronze.audit_territory_checks
 #  • Optional CLI arg --week_end=YYYY-MM-DD to backfill any specific week
 #  • Idempotent BigQuery loads via delete+append per (run_date_from, run_date_to)
-#  • NEW: Broker domain map additions:
+#  • Broker domain map additions:
 #       - wwfranchiseconsulting.com → BAI
 #       - franocity.com → IFPG
-#  • NEW: GCS prefixes now include week folders automatically: /YYYY/MM/DD
+#  • NEW: GCS prefixes now include week-based monthly folders: /YYYY/MM
+#  • NEW: Broker-master reference files in:
+#       gs://<GCS_BUCKET>/territory-checks/broker-master/
+#       - broker_master_caring_transitions.xls
+#       - broker_master_freshcoat.xls
+#       - broker_master_petwants.xls
+#       - broker_master_trublue.xls
 # ==============================================================================
 
 # ================================= Imports ====================================
@@ -40,6 +47,7 @@ import unicodedata
 import html
 import csv
 import argparse  # for CLI / Cloud Run Job parameters
+from io import BytesIO
 
 from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Iterable, List, Tuple, Optional
@@ -62,6 +70,12 @@ gv_LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 gv_GCS_BUCKET       = os.getenv("GCS_BUCKET", "")   # e.g. sfs-raw-us
 gv_GCS_PREFIX_EXCEL = os.getenv("GCS_PREFIX_EXCEL", "territory-checks/weekly")
 gv_GCS_PREFIX_RAW   = os.getenv("GCS_PREFIX_RAW", "territory-checks/raw")
+
+# NEW: broker master files (per brand)
+gv_GCS_BROKER_MASTER_PREFIX = os.getenv(
+    "GCS_PREFIX_BROKER_MASTER",
+    "territory-checks/broker-master",
+)
 
 # ---------------- BigQuery config (bronze layer) ----------------
 gv_BQ_PROJECT        = os.getenv("BQ_PROJECT", "sfs-data-lake")
@@ -88,13 +102,17 @@ gv_LOG = logging.getLogger("territory-checks")
 # ================================ Brand Rules =================================
 gv_BRAND_ADDRESSES: Dict[str, List[str]] = {
     "Caring Transitions": ["territorycheck@caringtransitions.com", "caringtransitions.com"],
-    "Fresh Coat"        : ["territorycheck@freshcoatpainters.com",
-                           "freshcoatpainters.com",
-                           "freshcoat.com"],
+    "Fresh Coat"        : [
+        "territorycheck@freshcoatpainters.com",
+        "freshcoatpainters.com",
+        "freshcoat.com",
+    ],
     "TruBlue"           : ["territorycheck@trublueally.com", "trublueally.com"],
-    "Growth Coach"      : ["territorycheck@thegrowthcoach.com",
-                           "thegrowthcoach.com",
-                           "growthcoach.com"],
+    "Growth Coach"      : [
+        "territorycheck@thegrowthcoach.com",
+        "thegrowthcoach.com",
+        "growthcoach.com",
+    ],
     "Pet Wants"         : ["territorycheck@petwants.com", "petwants.com"],
 }
 
@@ -123,7 +141,7 @@ gv_BROKER_DOMAIN_MAP: Dict[str, str] = {
     "franchise-connector.com"           : "BAI",
     "franchiseconnector.com"            : "BAI",
     "markfranchise.com"                 : "BAI",
-    "wwfranchiseconsulting.com"         : "BAI",   # NEW: Tim Weeks / WW Franchise → BAI
+    "wwfranchiseconsulting.com"         : "BAI",   # Tim Weeks / WW Franchise → BAI
     "franchisesource.com"               : "TES",
     "esourcecoach.com"                  : "TES",
     "frannet.com"                       : "FranNet",
@@ -137,7 +155,7 @@ gv_BROKER_DOMAIN_MAP: Dict[str, str] = {
     "successfran.net"                   : "SFA Advisors",
     "securefranchise.com"               : "SFA Advisors",
     "successfranchiseadvisors.com"      : "SFA Advisors",
-    "franocity.com"                     : "IFPG",  # NEW: Franocity chain should count as IFPG
+    "franocity.com"                     : "IFPG",  # Franocity chain should count as IFPG
 }
 gv_BROKER_ORDER = [
     "IFPG",
@@ -393,7 +411,7 @@ def _html_to_text(lv_html_str: str) -> str:
     """
     if not lv_html_str:
         return ""
-    lv_txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", lv_html_str)
+    lv_txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", lv_txt)
     lv_txt = re.sub(r"(?is)<br\s*/?>", "\n", lv_txt)
     lv_txt = re.sub(r"(?is)</p\s*>", "\n", lv_txt)
     lv_txt = re.sub(r"(?is)<.*?>", " ", lv_txt)
@@ -686,6 +704,131 @@ def join_prefix(base_prefix: str, *parts: str) -> str:
         return f"{base}/{extra}"
     return extra or base
 
+# ======================= Broker master (reference mapping) ====================
+# Cache: brand_slug -> { email_lower : agency }
+gv_BROKER_MASTER_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _brand_to_slug(brand_name: str) -> Optional[str]:
+    """
+    Map brand display name to the slug used in broker_master files.
+    Caring Transitions -> caring_transitions, etc.
+    """
+    mapping = {
+        "Caring Transitions": "caring_transitions",
+        "Fresh Coat"        : "freshcoat",
+        "Pet Wants"         : "petwants",
+        "TruBlue"           : "trublue",
+    }
+    return mapping.get(brand_name)
+
+
+def load_broker_master_for_brand(brand_name: str) -> Dict[str, str]:
+    """
+    Load (and cache) the broker master mapping for a brand from GCS.
+
+      gs://<bucket>/<gv_GCS_BROKER_MASTER_PREFIX>/broker_master_<slug>.xls
+
+    Returns: { email_lower : agency }
+    """
+    slug = _brand_to_slug(brand_name)
+    if not slug:
+        return {}
+
+    if slug in gv_BROKER_MASTER_CACHE:
+        return gv_BROKER_MASTER_CACHE[slug]
+
+    if not gv_GCS_BUCKET:
+        gv_LOG.info(
+            "GCS_BUCKET not set; skipping broker master for brand %s",
+            brand_name,
+        )
+        gv_BROKER_MASTER_CACHE[slug] = {}
+        return gv_BROKER_MASTER_CACHE[slug]
+
+    # Build blob path, e.g. "territory-checks/broker-master/broker_master_caring_transitions.xls"
+    blob_path = join_prefix(
+        gv_GCS_BROKER_MASTER_PREFIX,
+        f"broker_master_{slug}.xls",
+    )
+
+    client = storage.Client()
+    bucket = client.bucket(gv_GCS_BUCKET)
+    blob = bucket.blob(blob_path)
+
+    if not blob.exists():
+        gv_LOG.warning(
+            "Broker master file not found for brand %s at %s",
+            brand_name,
+            blob_path,
+        )
+        gv_BROKER_MASTER_CACHE[slug] = {}
+        return gv_BROKER_MASTER_CACHE[slug]
+
+    buf = BytesIO()
+    blob.download_to_file(buf)
+    buf.seek(0)
+
+    try:
+        df = pd.read_excel(buf)
+    except Exception as e:
+        gv_LOG.warning(
+            "Error reading broker master for brand %s at %s: %s",
+            brand_name,
+            blob_path,
+            e,
+        )
+        gv_BROKER_MASTER_CACHE[slug] = {}
+        return gv_BROKER_MASTER_CACHE[slug]
+
+    # Expect columns: "Email", "Agency"
+    if "Email" not in df.columns or "Agency" not in df.columns:
+        gv_LOG.warning(
+            "Broker master for brand %s missing Email/Agency columns",
+            brand_name,
+        )
+        gv_BROKER_MASTER_CACHE[slug] = {}
+        return gv_BROKER_MASTER_CACHE[slug]
+
+    df["Email_clean"] = df["Email"].astype(str).str.strip().str.lower()
+    df["Agency_clean"] = df["Agency"].astype(str).str.strip()
+
+    mapping = (
+        df[["Email_clean", "Agency_clean"]]
+        .dropna(subset=["Email_clean", "Agency_clean"])
+        .drop_duplicates(subset=["Email_clean"])
+        .set_index("Email_clean")["Agency_clean"]
+        .to_dict()
+    )
+
+    gv_LOG.info(
+        "Loaded %d broker master rows for brand %s (%s)",
+        len(mapping),
+        brand_name,
+        slug,
+    )
+
+    gv_BROKER_MASTER_CACHE[slug] = mapping
+    return mapping
+
+
+def resolve_broker_from_master(brand_name: str, sender_email: str) -> Optional[str]:
+    """
+    Given the SFS brand and the sender's email, try to resolve a broker agency
+    using the broker master Excel for that brand.
+
+    Returns agency string (e.g. 'IFPG', 'BAI', 'FranServe') or None.
+    """
+    if not sender_email:
+        return None
+
+    mapping = load_broker_master_for_brand(brand_name)
+    if not mapping:
+        return None
+
+    email_key = sender_email.strip().lower()
+    return mapping.get(email_key)
+
 # ================================== Main ======================================
 def run(lv_override_week_end_str: Optional[str] = None) -> dict:
     """
@@ -723,10 +866,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
     lv_run_date_from = lv_start_dt.date()
     lv_run_date_to   = lv_end_dt.date()
 
-    # Derive YYYY/MM/DD folder parts from the week end date (end_inclusive)
+    # Derive YYYY/MM folder parts from the week end date (end_inclusive)
     lv_year  = f"{lv_end_dt.year:04d}"
     lv_month = f"{lv_end_dt.month:02d}"
-    lv_day   = f"{lv_end_dt.day:02d}"
 
     gv_LOG.info(
         "Processing week window: %s → %s (%s) [end_exclusive=%s]",
@@ -810,7 +952,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_broker_dom  = broker_from_sender(lv_msg.get("from"))
             lv_chosen_broker = lv_broker_subj or lv_broker_fw or lv_broker_dom
 
-            # ----- NEW: If still Others, try to rescue via full body text
+            # ----- If still Others, try to rescue via full body text
             if lv_chosen_broker == "Others":
                 try:
                     lv_body_html = lv_client.fetch_full_body(lv_msg["id"])
@@ -824,6 +966,19 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         lv_msg.get("id"),
                         lv_e,
                     )
+
+            # ----- NEW: If still Others, try broker master lookup in GCS
+            # Uses per-brand Excel (broker_master_<brand>.xls) keyed by Email.
+            if lv_chosen_broker == "Others" and lv_brand not in (None, "", "Unmapped"):
+                lv_master_broker = resolve_broker_from_master(lv_brand, lv_sender)
+                if lv_master_broker:
+                    gv_LOG.debug(
+                        "Resolved broker via master file: brand=%s email=%s → %s",
+                        lv_brand,
+                        lv_sender,
+                        lv_master_broker,
+                    )
+                    lv_chosen_broker = lv_master_broker
 
             # If still Others, produce friendly label in details
             lv_detail_broker_label = lv_chosen_broker
@@ -944,8 +1099,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_file_label,
         )
 
-        # Dynamic GCS prefixes even for empty week
-        excel_prefix = join_prefix(gv_GCS_PREFIX_EXCEL, lv_year, lv_month, lv_day)
+        # Dynamic GCS prefixes even for empty week (by month of week end)
+        excel_prefix = join_prefix(gv_GCS_PREFIX_EXCEL, lv_year, lv_month)
         excel_gcs_uri = upload_file_to_gcs(
             excel_local_path,
             excel_prefix,
@@ -1177,11 +1332,11 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         lv_file_label,
     )
 
-    # ---- Dynamic week-based prefixes for GCS ----
-    excel_prefix     = join_prefix(gv_GCS_PREFIX_EXCEL, lv_year, lv_month, lv_day)
-    territory_prefix = join_prefix(gv_GCS_PREFIX_RAW, "territory", lv_year, lv_month, lv_day)
-    unmapped_prefix  = join_prefix(gv_GCS_PREFIX_RAW, "unmapped", lv_year, lv_month, lv_day)
-    audit_prefix     = join_prefix(gv_GCS_PREFIX_RAW, "audit", lv_year, lv_month, lv_day)
+    # ---- Dynamic week-based prefixes for GCS (monthly folders by week end) ----
+    excel_prefix     = join_prefix(gv_GCS_PREFIX_EXCEL, lv_year, lv_month)
+    territory_prefix = join_prefix(gv_GCS_PREFIX_RAW, "territory", lv_year, lv_month)
+    unmapped_prefix  = join_prefix(gv_GCS_PREFIX_RAW, "unmapped", lv_year, lv_month)
+    audit_prefix     = join_prefix(gv_GCS_PREFIX_RAW, "audit", lv_year, lv_month)
 
     raw_gcs_uri      = upload_file_to_gcs(raw_local_path,      territory_prefix)
     unmapped_gcs_uri = upload_file_to_gcs(unmapped_local_path, unmapped_prefix)
@@ -1299,7 +1454,7 @@ def _write_workbook(
 
             lv_ws.append(lv_cols_detail)
             for _, lv_r in lv_sub_out.iterrows():
-                lv_ws.append([lv_r[lv_c] for lv_c in lv_cols_detail])
+                lv_ws.append(lv_r[lv_c] for lv_c in lv_cols_detail)
 
             lv_col_base = 7
             lv_summary = (
@@ -1464,7 +1619,7 @@ def _write_workbook(
     ]
     lv_ws_a.append(lv_cols_a)
     for lv_row in lv_audit_rows:
-        lv_ws_a.append([lv_row.get(lv_c, "") for lv_c in lv_cols_a])
+        lv_ws_a.append(lv_row.get(lv_c, "") for lv_c in lv_cols_a)
 
     if "Index" in lv_wb.sheetnames and len(lv_wb.sheetnames) > 1:
         del lv_wb["Index"]
@@ -1492,7 +1647,7 @@ def _write_workbook(
 def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
     """
     Upload a local file to GCS.
-    `prefix` is a folder path like "territory-checks/weekly/2025/11/29".
+    `prefix` is a folder path like "territory-checks/weekly/2025/07".
     Returns the gs:// URI or None if GCS_BUCKET is not configured.
     """
     if not gv_GCS_BUCKET:
