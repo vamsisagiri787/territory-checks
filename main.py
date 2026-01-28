@@ -315,71 +315,6 @@ def _norm(lv_text: str) -> str:
     lv_s = re.sub(r"\s+", " ", lv_s).strip()
     return lv_s
 
-
-# ------------------------ Count/Report Exclusions -----------------------------
-# We still READ all messages for auditing, but we EXCLUDE some messages from the
-# weekly territory counts/details output (they remain visible in the Audit tab).
-gv_EXCLUDE_SENDER_DOMAINS_FOR_COUNTS = {
-    'strategicfranchising.com',
-}
-
-gv_EXCLUDE_SENDER_EMAILS_FOR_COUNTS = {
-    'rgalloway@strategicfranchising.com',
-}
-
-gv_EXCLUDE_SUBJECT_KEYWORDS_FOR_COUNTS = [
-    'undeliverable',
-    'delivery status notification',
-    'mail delivery failed',
-    'failure notice',
-    'returned mail',
-]
-
-def exclusion_reason_for_counts(
-    lv_subject: str,
-    lv_sender_email: str,
-    lv_territory: str,
-    lv_body_preview: str = "",
-    lv_full_body_text: str | None = None,
-) -> str:
-    """Return a non-empty reason to exclude a message from counts/details.
-
-    We still keep these messages in the Audit output so nothing is lost.
-    """
-    lv_subj_n = _norm(lv_subject or "")
-    lv_sender = (lv_sender_email or "").strip().lower()
-    lv_sender_domain = lv_sender.split("@")[-1] if "@" in lv_sender else ""
-    lv_full = lv_full_body_text or ""
-    lv_body_n = _norm((lv_body_preview or "") + "\n" + lv_full)
-
-    # Bounce / DSN / mail failure
-    for lv_kw in gv_EXCLUDE_SUBJECT_KEYWORDS_FOR_COUNTS:
-        if lv_kw in lv_subj_n:
-            return f"Excluded for counts: bounce/dsn ('{lv_kw}')"
-
-    # Tests (avoid excluding legitimate 'contest' etc.)
-    if re.search(r"\btest\b", lv_subj_n) and len(lv_subj_n) <= 30:
-        return "Excluded for counts: test subject"
-
-    # IFPG 'question' / registration style emails (not a territory check)
-    if "has a question" in lv_subj_n or "formal registration" in lv_body_n or "details to follow" in lv_body_n:
-        return "Excluded for counts: IFPG question/registration (no territory)"
-
-    # IFPG resale listing blast (not a territory check)
-    if "franchise resales listed with the ifpg" in lv_body_n:
-        return "Excluded for counts: IFPG resales listing (not a territory check)"
-
-    # Internal senders (other pipelines / internal chatter)
-    if lv_sender in gv_EXCLUDE_SENDER_EMAILS_FOR_COUNTS:
-        return "Excluded for counts: internal sender"
-    if lv_sender_domain in gv_EXCLUDE_SENDER_DOMAINS_FOR_COUNTS:
-        return "Excluded for counts: internal sender domain"
-
-    # No territory extracted => don't count it
-    if not (lv_territory or "").strip():
-        return "Excluded for counts: no territory extracted"
-
-    return ""
 def _norm_name(lv_name: str) -> str:
     lv_s = _norm(lv_name)
     lv_s = re.sub(r"[^a-z0-9 ]", " ", lv_s)
@@ -544,7 +479,6 @@ gv_ANYWHERE_TERR_FALLBACK = re.compile(
 )
 
 def territory_from_subject(lv_subject: str) -> str:
-    """Extract a simple territory hint from the subject line."""
     lv_s = _norm(lv_subject)
     for lv_pat in gv_TERR_PATTERNS:
         lv_m = lv_pat.search(lv_s)
@@ -558,64 +492,7 @@ def _clean_territory(lv_raw: str) -> str:
     lv_s = re.sub(r"\s+", " ", lv_s)
     return lv_s.title()
 
-def _extract_ifpg_territory_block(lv_text: str) -> str:
-    """Return the IFPG 'Territory Check from ...:' block when present."""
-    if not lv_text:
-        return ""
-    lv_m = re.search(
-        r"Territory\s+Check\s+from[\s\S]{0,200}?:(?P<blk>[\s\S]*?)CLICK\s+HERE\s+TO\s+REPLY",
-        lv_text,
-        re.IGNORECASE,
-    )
-    return (lv_m.group("blk") if lv_m else "") or ""
-
-
-def _territory_from_text_loose(lv_text: str) -> str:
-    """Best-effort territory extraction from plain text (zip/city-state/line)."""
-    if not lv_text:
-        return ""
-
-    # 1) ZIP list (common in IFPG)
-    lv_zips = re.findall(r"\b\d{5}\b", lv_text)
-    if len(lv_zips) >= 1:
-        lv_seen = set()
-        lv_unique: list[str] = []
-        for z in lv_zips:
-            if z not in lv_seen:
-                lv_seen.add(z)
-                lv_unique.append(z)
-        return " ".join(lv_unique)
-
-    # 2) City, ST ZIP  (Raleigh, NC 27601)
-    lv_m = re.search(r"\b([A-Za-z][A-Za-z .\-']+?,\s*[A-Za-z]{2}\s+\d{5})\b", lv_text)
-    if lv_m:
-        return _clean_territory(lv_m.group(1))
-
-    # 3) City ST ZIP (Dallas PA 18612)
-    lv_m = re.search(r"\b([A-Za-z][A-Za-z .\-']+\s+[A-Za-z]{2}\s+\d{5})\b", lv_text)
-    if lv_m:
-        return _clean_territory(lv_m.group(1))
-
-    # 4) Descriptive area + ST + ZIP (Raleigh-Durham-Chapel Hill Area NC 27513)
-    lv_m = re.search(r"\b([A-Za-z0-9][A-Za-z0-9 .\-']+\s+[A-Za-z]{2}\s+\d{5})\b", lv_text)
-    if lv_m:
-        return _clean_territory(lv_m.group(1))
-
-    # 5) City ST (brentwood ca)
-    # Prefer a short line that looks like a place.
-    for lv_line in (lv_text or "").splitlines():
-        lv_ln = lv_line.strip()
-        if not lv_ln or len(lv_ln) > 60:
-            continue
-        lv_m = re.search(r"\b([A-Za-z][A-Za-z .\-']+)\s+([A-Za-z]{2})\b", lv_ln)
-        if lv_m:
-            return _clean_territory(f"{lv_m.group(1)} {lv_m.group(2)}")
-
-    return ""
-
-
 def territory_from_any(lv_subject: str, lv_body_preview: str, lv_full_body_text: str | None = None) -> str:
-    """Extract territory from subject/body with IFPG-friendly fallbacks."""
     lv_terr = territory_from_subject(lv_subject)
     if lv_terr:
         return lv_terr
@@ -625,22 +502,23 @@ def territory_from_any(lv_subject: str, lv_body_preview: str, lv_full_body_text:
         if lv_m:
             return _clean_territory(lv_m.group(1))
 
-    # Fallback: if IFPG lead-feed template, extract only the TC block (avoids signature noise)
-    lv_full = lv_full_body_text or ""
-    lv_blk = _extract_ifpg_territory_block(lv_full) or _extract_ifpg_territory_block(lv_body_preview or "")
-    if lv_blk:
-        lv_t = _territory_from_text_loose(lv_blk)
-        if lv_t:
-            return lv_t
-
-    # General fallback: anywhere in full/body
-    lv_m = gv_ANYWHERE_TERR_FALLBACK.search(lv_full or (lv_body_preview or ""))
+    lv_m = gv_ANYWHERE_TERR_FALLBACK.search(lv_body_preview or "")
     if lv_m:
         return _clean_territory(lv_m.group(1))
 
-    # Last-chance loose parse from combined text
-    lv_combo = (lv_full_body_text or "") + "\n" + (lv_body_preview or "")
-    return _territory_from_text_loose(lv_combo)
+    if lv_full_body_text:
+        for lv_pat in gv_BODY_TERR_PATTERNS:
+            lv_m = lv_pat.search(lv_full_body_text)
+            if lv_m:
+                return _clean_territory(lv_m.group(1))
+        lv_m = gv_ANYWHERE_TERR_FALLBACK.search(lv_full_body_text)
+        if lv_m:
+            return _clean_territory(lv_m.group(1))
+        lv_m = re.search(r"\b([A-Za-z .'\-]+,\s*[A-Za-z]{2})\b", lv_full_body_text)
+        if lv_m:
+            return _clean_territory(lv_m.group(1))
+
+    return ""
 
 def pretty_label_from_domain(lv_email_or_domain: str) -> str:
     lv_dom = (lv_email_or_domain or "").split("@")[-1].lower()
@@ -990,13 +868,6 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_recv    = lv_msg.get("receivedDateTime", "")
             lv_recv_dt = lv_recv[:10] if lv_recv else ""
 
-            # Exclude non-territory / noise emails from the weekly counts & details output.
-            # (Still included in Audit tab.)
-            lv_count_excl = exclusion_reason_for_counts(lv_subj, lv_sender, lv_terr, lv_body_preview, lv_full_text)
-            if lv_count_excl and not lv_skipped_reason:
-                lv_skipped_reason = lv_count_excl
-
-
             lv_to_str  = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("toRecipients") or [])])
             lv_cc_str  = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("ccRecipients") or [])])
             lv_bcc_str = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("bccRecipients") or [])])
@@ -1113,7 +984,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         "brand_name","brand_source","broker_brand","broker_name","territory","received_utc",
         "subject","from_email","folder_name","run_date_from","run_date_to","run_timestamp"
     ]]
-    
+
     df_audit = pd.DataFrame(lv_audit_rows)
     if not df_audit.empty:
         df_audit["run_date_from"] = lv_run_date_from
@@ -1142,7 +1013,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         df_audit = df_audit[[
             "folder_name","brand_name","brand_source","is_forward","is_reply","subject","from_email",
             "to_email","cc_email","bcc_email","body_preview","received_utc","fetched_full_body",
-            "chosen_broker",
+            "attempted_full_body_fetch","chosen_broker","skipped_reason",
             "run_date_from","run_date_to","run_timestamp"
         ]]
 
@@ -1369,7 +1240,9 @@ def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
             bigquery.SchemaField("body_preview", "STRING"),
             bigquery.SchemaField("received_utc", "TIMESTAMP"),
             bigquery.SchemaField("fetched_full_body", "BOOL"),
+            bigquery.SchemaField("attempted_full_body_fetch", "BOOL"),
             bigquery.SchemaField("chosen_broker", "STRING"),
+            bigquery.SchemaField("skipped_reason", "STRING"),
             bigquery.SchemaField("run_date_from", "DATE"),
             bigquery.SchemaField("run_date_to", "DATE"),
             bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
