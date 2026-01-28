@@ -992,7 +992,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
 
             # Exclude non-territory / noise emails from the weekly counts & details output.
             # (Still included in Audit tab.)
-            lv_count_excl = exclusion_reason_for_counts(lv_subj, lv_sender, lv_terr, lv_body_preview, lv_full_body_text)
+            lv_count_excl = exclusion_reason_for_counts(lv_subj, lv_sender, lv_terr, lv_body_preview, lv_full_text)
             if lv_count_excl and not lv_skipped_reason:
                 lv_skipped_reason = lv_count_excl
 
