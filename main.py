@@ -315,6 +315,52 @@ def _norm(lv_text: str) -> str:
     lv_s = re.sub(r"\s+", " ", lv_s).strip()
     return lv_s
 
+
+# ------------------------ Count/Report Exclusions -----------------------------
+# We still READ all messages for auditing, but we EXCLUDE some messages from the
+# weekly territory counts/details output (they remain visible in the Audit tab).
+gv_EXCLUDE_SENDER_DOMAINS_FOR_COUNTS = {
+    'strategicfranchising.com',
+}
+
+gv_EXCLUDE_SENDER_EMAILS_FOR_COUNTS = {
+    'rgalloway@strategicfranchising.com',
+}
+
+gv_EXCLUDE_SUBJECT_KEYWORDS_FOR_COUNTS = [
+    'undeliverable',
+    'delivery status notification',
+    'mail delivery failed',
+    'failure notice',
+    'returned mail',
+]
+
+def exclusion_reason_for_counts(lv_subject: str, lv_sender_email: str, lv_territory: str) -> str:
+    """Return a non-empty reason to exclude a message from counts/details."""
+    lv_subj_n = _norm(lv_subject or '')
+    lv_sender = (lv_sender_email or '').strip().lower()
+    lv_sender_domain = lv_sender.split('@')[-1] if '@' in lv_sender else ''
+
+    # Bounce / DSN / mail failure
+    for lv_kw in gv_EXCLUDE_SUBJECT_KEYWORDS_FOR_COUNTS:
+        if lv_kw in lv_subj_n:
+            return f"Excluded for counts: bounce/dsn ('{lv_kw}')"
+
+    # Tests (avoid excluding legitimate 'contest' etc.)
+    if re.search(r"\btest\b", lv_subj_n) and len(lv_subj_n) <= 30:
+        return "Excluded for counts: test subject"
+
+    # Internal senders (other pipelines / internal chatter)
+    if lv_sender in gv_EXCLUDE_SENDER_EMAILS_FOR_COUNTS:
+        return "Excluded for counts: internal sender"
+    if lv_sender_domain in gv_EXCLUDE_SENDER_DOMAINS_FOR_COUNTS:
+        return "Excluded for counts: internal sender domain"
+
+    # No territory extracted => don't count it
+    if not (lv_territory or '').strip():
+        return "Excluded for counts: no territory extracted"
+
+    return ''
 def _norm_name(lv_name: str) -> str:
     lv_s = _norm(lv_name)
     lv_s = re.sub(r"[^a-z0-9 ]", " ", lv_s)
@@ -868,6 +914,13 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_recv    = lv_msg.get("receivedDateTime", "")
             lv_recv_dt = lv_recv[:10] if lv_recv else ""
 
+            # Exclude non-territory / noise emails from the weekly counts & details output.
+            # (Still included in Audit tab.)
+            lv_count_excl = exclusion_reason_for_counts(lv_subj, lv_sender, lv_terr)
+            if lv_count_excl and not lv_skipped_reason:
+                lv_skipped_reason = lv_count_excl
+
+
             lv_to_str  = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("toRecipients") or [])])
             lv_cc_str  = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("ccRecipients") or [])])
             lv_bcc_str = ";".join([(x.get("emailAddress") or {}).get("address", "") for x in (lv_msg.get("bccRecipients") or [])])
@@ -984,7 +1037,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         "brand_name","brand_source","broker_brand","broker_name","territory","received_utc",
         "subject","from_email","folder_name","run_date_from","run_date_to","run_timestamp"
     ]]
-
+    
     df_audit = pd.DataFrame(lv_audit_rows)
     if not df_audit.empty:
         df_audit["run_date_from"] = lv_run_date_from
@@ -1013,7 +1066,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         df_audit = df_audit[[
             "folder_name","brand_name","brand_source","is_forward","is_reply","subject","from_email",
             "to_email","cc_email","bcc_email","body_preview","received_utc","fetched_full_body",
-            "attempted_full_body_fetch","chosen_broker","skipped_reason",
+            "chosen_broker",
             "run_date_from","run_date_to","run_timestamp"
         ]]
 
@@ -1240,9 +1293,7 @@ def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
             bigquery.SchemaField("body_preview", "STRING"),
             bigquery.SchemaField("received_utc", "TIMESTAMP"),
             bigquery.SchemaField("fetched_full_body", "BOOL"),
-            bigquery.SchemaField("attempted_full_body_fetch", "BOOL"),
             bigquery.SchemaField("chosen_broker", "STRING"),
-            bigquery.SchemaField("skipped_reason", "STRING"),
             bigquery.SchemaField("run_date_from", "DATE"),
             bigquery.SchemaField("run_date_to", "DATE"),
             bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
