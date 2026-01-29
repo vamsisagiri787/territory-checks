@@ -300,6 +300,13 @@ gv_RE_PREFIX = re.compile(r"^\s*re\s*[:\-]\s*", re.IGNORECASE)
 gv_FW_PREFIX = re.compile(r"^\s*(fw|fwd)\s*[:\-]\s*", re.IGNORECASE)
 gv_RE_REPLY_IN_CHAT = re.compile(r"reply in chat", re.IGNORECASE)
 
+# Exclusion patterns (do NOT exclude noreply; exclude only TEST + UNDELIVERABLE/bounce)
+gv_RE_TEST_SUBJECT = re.compile(r"^\s*test(\s|$)|^\s*test\s*message\b", re.IGNORECASE)
+gv_RE_UNDELIVERABLE_SUBJECT = re.compile(
+    r"^\s*undeliverable\b|delivery status notification|mail delivery subsystem|returned mail|delivery has failed|failure notice",
+    re.IGNORECASE,
+)
+
 def is_reply(lv_s: str) -> bool:
     return bool(gv_RE_PREFIX.match(lv_s or ""))
 
@@ -794,7 +801,13 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_fetched_full_body: bool = False
 
             lv_skipped_reason = ""
-            if is_reply_in_chat(lv_subj, lv_body_preview):
+
+            # Exclusions for KPI counts (keep raw/audit; exclude only TEST + UNDELIVERABLE)
+            if gv_RE_TEST_SUBJECT.search(lv_subj):
+                lv_skipped_reason = "Test"
+            elif gv_RE_UNDELIVERABLE_SUBJECT.search(lv_subj):
+                lv_skipped_reason = "Undeliverable"
+            elif is_reply_in_chat(lv_subj, lv_body_preview):
                 lv_skipped_reason = "Reply in Chat"
             elif gv_SKIP_REPLIES and lv_is_reply:
                 lv_skipped_reason = "Reply"
@@ -889,6 +902,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 "AttemptedFullBodyFetch": lv_attempted_full_body_fetch,
                 "Chosen Broker (bucket)": lv_chosen_broker,
                 "SkippedReason"         : lv_skipped_reason,
+                "SkipOverride"         : True if lv_skipped_reason else False,
             })
 
             if lv_skipped_reason:
@@ -1008,12 +1022,13 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             "AttemptedFullBodyFetch": "attempted_full_body_fetch",
             "Chosen Broker (bucket)": "chosen_broker",
             "SkippedReason": "skipped_reason",
+            "SkipOverride": "skip_override",
         })
 
         df_audit = df_audit[[
             "folder_name","brand_name","brand_source","is_forward","is_reply","subject","from_email",
             "to_email","cc_email","bcc_email","body_preview","received_utc","fetched_full_body",
-            "attempted_full_body_fetch","chosen_broker","skipped_reason",
+            "attempted_full_body_fetch","chosen_broker","skipped_reason","skip_override",
             "run_date_from","run_date_to","run_timestamp"
         ]]
 
@@ -1243,6 +1258,7 @@ def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
             bigquery.SchemaField("attempted_full_body_fetch", "BOOL"),
             bigquery.SchemaField("chosen_broker", "STRING"),
             bigquery.SchemaField("skipped_reason", "STRING"),
+            bigquery.SchemaField("skip_override", "BOOL"),
             bigquery.SchemaField("run_date_from", "DATE"),
             bigquery.SchemaField("run_date_to", "DATE"),
             bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
