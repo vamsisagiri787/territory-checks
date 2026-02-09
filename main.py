@@ -62,6 +62,42 @@ gv_COUNT_FORWARDS          = True
 gv_SKIP_REPLIES            = True
 gv_SHOW_SUBJECT_IN_DETAILS = True
 
+# ======================= Internal Announcements (Skip from Counts) =======================
+# Emails that should be excluded from brand-wise territory counts but still appear in Audit.
+# Override/extend via ENV: INTERNAL_ANNOUNCEMENT_SENDERS (comma-separated).
+# Example: INTERNAL_ANNOUNCEMENT_SENDERS="rgalloway@strategicfranchising.com,another@strategicfranchising.com"
+
+gv_INTERNAL_ANNOUNCEMENT_SENDERS = {
+    s.strip().lower()
+    for s in (os.getenv("INTERNAL_ANNOUNCEMENT_SENDERS", "rgalloway@strategicfranchising.com").split(","))
+    if s.strip()
+}
+
+gv_INTERNAL_ANNOUNCEMENT_SUBJECT_HINTS = [
+    "total balance",
+    "net balance",
+    "amount to draft",
+    "released date",
+    "balances and deposits",
+    "deposit",
+    "balance",
+]
+
+def is_internal_announcement(sender_email: str, sender_name: str, subject: str, body_preview: str) -> bool:
+    se = (sender_email or "").strip().lower()
+    sn = (sender_name or "").strip().lower()
+    if se and se in gv_INTERNAL_ANNOUNCEMENT_SENDERS:
+        return True
+
+    # Extra safety: if sender looks like Rebecca (name/alias) treat as internal
+    if "rebecca" in sn or "rgalloway" in se:
+        # Only apply this name-based shortcut for internal domains
+        if se.endswith("@strategicfranchising.com") or se.endswith("@sfs") or "strategicfranchising" in se:
+            return True
+
+    hay = f"{subject or ''} {body_preview or ''}".lower()
+    return any(h in hay for h in gv_INTERNAL_ANNOUNCEMENT_SUBJECT_HINTS)
+
 gv_USER_AGENT   = "TerritoryChecks/3.3"
 gv_HTTP_TIMEOUT = 60
 gv_MAX_RETRIES  = 5
@@ -299,13 +335,6 @@ class GraphClient:
 gv_RE_PREFIX = re.compile(r"^\s*re\s*[:\-]\s*", re.IGNORECASE)
 gv_FW_PREFIX = re.compile(r"^\s*(fw|fwd)\s*[:\-]\s*", re.IGNORECASE)
 gv_RE_REPLY_IN_CHAT = re.compile(r"reply in chat", re.IGNORECASE)
-
-# Exclusion patterns (do NOT exclude noreply; exclude only TEST + UNDELIVERABLE/bounce)
-gv_RE_TEST_SUBJECT = re.compile(r"^\s*test(\s|$)|^\s*test\s*message\b", re.IGNORECASE)
-gv_RE_UNDELIVERABLE_SUBJECT = re.compile(
-    r"^\s*undeliverable\b|delivery status notification|mail delivery subsystem|returned mail|delivery has failed|failure notice",
-    re.IGNORECASE,
-)
 
 def is_reply(lv_s: str) -> bool:
     return bool(gv_RE_PREFIX.match(lv_s or ""))
@@ -801,13 +830,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_fetched_full_body: bool = False
 
             lv_skipped_reason = ""
-
-            # Exclusions for KPI counts (keep raw/audit; exclude only TEST + UNDELIVERABLE)
-            if gv_RE_TEST_SUBJECT.search(lv_subj):
-                lv_skipped_reason = "Test"
-            elif gv_RE_UNDELIVERABLE_SUBJECT.search(lv_subj):
-                lv_skipped_reason = "Undeliverable"
-            elif is_reply_in_chat(lv_subj, lv_body_preview):
+            if is_reply_in_chat(lv_subj, lv_body_preview):
                 lv_skipped_reason = "Reply in Chat"
             elif gv_SKIP_REPLIES and lv_is_reply:
                 lv_skipped_reason = "Reply"
@@ -829,6 +852,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_from_obj    = (lv_msg.get("from") or {}).get("emailAddress") or {}
             lv_sender      = (lv_from_obj.get("address") or "").strip()
             lv_sender_name = (lv_from_obj.get("name") or "").strip() or lv_sender
+
+
+            # Internal announcements should NOT be counted in brand sheets (they used to inflate 'Others').
+            # Keep them in Audit with a clear skipped_reason.
+            if not lv_skipped_reason and is_internal_announcement(lv_sender, lv_sender_name, lv_subj, lv_body_preview):
+                lv_skipped_reason = "Internal Announcement"
 
             lv_broker_subj = broker_from_subject(lv_subj)
             lv_broker_fw   = None if lv_broker_subj else forwarded_broker_from_text(lv_body_preview)
@@ -902,7 +931,6 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 "AttemptedFullBodyFetch": lv_attempted_full_body_fetch,
                 "Chosen Broker (bucket)": lv_chosen_broker,
                 "SkippedReason"         : lv_skipped_reason,
-                "SkipOverride"         : True if lv_skipped_reason else False,
             })
 
             if lv_skipped_reason:
@@ -1022,13 +1050,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             "AttemptedFullBodyFetch": "attempted_full_body_fetch",
             "Chosen Broker (bucket)": "chosen_broker",
             "SkippedReason": "skipped_reason",
-            "SkipOverride": "skip_override",
         })
 
         df_audit = df_audit[[
             "folder_name","brand_name","brand_source","is_forward","is_reply","subject","from_email",
             "to_email","cc_email","bcc_email","body_preview","received_utc","fetched_full_body",
-            "attempted_full_body_fetch","chosen_broker","skipped_reason","skip_override",
+            "attempted_full_body_fetch","chosen_broker","skipped_reason",
             "run_date_from","run_date_to","run_timestamp"
         ]]
 
@@ -1258,7 +1285,6 @@ def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
             bigquery.SchemaField("attempted_full_body_fetch", "BOOL"),
             bigquery.SchemaField("chosen_broker", "STRING"),
             bigquery.SchemaField("skipped_reason", "STRING"),
-            bigquery.SchemaField("skip_override", "BOOL"),
             bigquery.SchemaField("run_date_from", "DATE"),
             bigquery.SchemaField("run_date_to", "DATE"),
             bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
