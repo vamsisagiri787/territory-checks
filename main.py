@@ -23,6 +23,7 @@ import unicodedata
 import html
 import csv
 import argparse
+import hashlib
 from io import BytesIO
 
 from datetime import datetime, timedelta, timezone, date
@@ -53,10 +54,16 @@ gv_GCS_BROKER_MASTER_PREFIX = os.getenv(
 
 gv_BQ_PROJECT        = os.getenv("BQ_PROJECT", "sfs-data-lake")
 gv_BQ_DATASET_BRONZE = os.getenv("BQ_DATASET_BRONZE", "bronze")
+gv_BQ_DATASET_SILVER = os.getenv("BQ_DATASET_SILVER", "silver")
+gv_BQ_LOCATION       = os.getenv("BQ_LOCATION", "US")
 
 gv_BQ_TABLE_TERRITORY = os.getenv("BQ_TABLE_TERRITORY", "territory_checks_raw")
 gv_BQ_TABLE_UNMAPPED  = os.getenv("BQ_TABLE_UNMAPPED", "unmapped_territory_checks")
 gv_BQ_TABLE_AUDIT     = os.getenv("BQ_TABLE_AUDIT", "audit_territory_checks")
+gv_BQ_TABLE_INTERNAL_BRONZE = os.getenv("BQ_TABLE_INTERNAL_BRONZE", "sfs_internal_announcements_raw")
+gv_BQ_TABLE_INTERNAL_SILVER = os.getenv("BQ_TABLE_INTERNAL_SILVER", "sfs_internal_announcements")
+gv_GCS_PREFIX_INTERNAL_FINAL = os.getenv("GCS_PREFIX_INTERNAL_FINAL", "sfs_strategic_franchising/Balances and Deposits")
+gv_INTERNAL_PARSER_VERSION = os.getenv("INTERNAL_PARSER_VERSION", "internal-announcements-v1")
 
 gv_COUNT_FORWARDS          = True
 gv_SKIP_REPLIES            = True
@@ -97,6 +104,209 @@ def is_internal_announcement(sender_email: str, sender_name: str, subject: str, 
 
     hay = f"{subject or ''} {body_preview or ''}".lower()
     return any(h in hay for h in gv_INTERNAL_ANNOUNCEMENT_SUBJECT_HINTS)
+
+# ===================== Internal Announcement Parsing (Balances/Deposits) =====================
+INTERNAL_EXCEL_RAW_COLS = [
+    "received_datetime",
+    "sender_email",
+    "subject",
+    "web_link",
+    "body_preview",
+    "skipped_reason",
+    "extracted_fields_json",
+]
+
+INTERNAL_EXCEL_FINAL_COLS = [
+    "brand",
+    "director_of_franchising",
+    "franchisee_name",
+    "franchisee_id",
+    "state_code",
+    "lead_source",
+    "announcement_type",
+    "signing_date",
+    "amount_usd",
+]
+
+def _internal_money_to_decimal(s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.search(r"(?:\$?\s*)(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)", s)
+    if not m:
+        return None
+    return m.group(1).replace(",", "")
+
+def _internal_parse_date_any(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except Exception:
+            pass
+    return None
+
+def _internal_state_from_city_state(v: str) -> Optional[str]:
+    if not v:
+        return None
+    v = v.strip()
+    m = re.search(r"\b([A-Z]{2})\b$", v)
+    if m:
+        return m.group(1).upper()
+    parts = [p.strip() for p in v.split(",") if p.strip()]
+    if len(parts) >= 2:
+        us_state = {
+            "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR","california":"CA","colorado":"CO",
+            "connecticut":"CT","delaware":"DE","florida":"FL","georgia":"GA","hawaii":"HI","idaho":"ID",
+            "illinois":"IL","indiana":"IN","iowa":"IA","kansas":"KS","kentucky":"KY","louisiana":"LA",
+            "maine":"ME","maryland":"MD","massachusetts":"MA","michigan":"MI","minnesota":"MN","mississippi":"MS",
+            "missouri":"MO","montana":"MT","nebraska":"NE","nevada":"NV","new hampshire":"NH","new jersey":"NJ",
+            "new mexico":"NM","new york":"NY","north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK",
+            "oregon":"OR","pennsylvania":"PA","rhode island":"RI","south carolina":"SC","south dakota":"SD",
+            "tennessee":"TN","texas":"TX","utah":"UT","vermont":"VT","virginia":"VA","washington":"WA",
+            "west virginia":"WV","wisconsin":"WI","wyoming":"WY","district of columbia":"DC"
+        }
+        return us_state.get(parts[-1].lower())
+    return None
+
+def _internal_kv_value(text: str, key: str) -> Optional[str]:
+    if not text or not key:
+        return None
+    k = re.escape(key.strip())
+    pat = rf"(?im)^\s*{k}\s*:?\s*$\s*^\s*(.+?)\s*$"
+    m = re.search(pat, text)
+    if m:
+        v = m.group(1).strip()
+        return v if v and v.lower() not in {"n/a", "na", "-"} else None
+    pat2 = rf"(?im)^\s*{k}\s*:?\s*(.+?)\s*$"
+    m2 = re.search(pat2, text)
+    if m2:
+        v = m2.group(1).strip()
+        return v if v and v.lower() not in {"n/a", "na", "-"} else None
+    return None
+
+def _internal_looks_like_template(text: str) -> bool:
+    t = (text or "").lower()
+    must = 0
+    for k in ("name", "released date", "fsc"):
+        if k in t:
+            must += 1
+    has_amount = ("amount to draft today" in t) or ("amount" in t)
+    return must >= 2 and has_amount
+
+def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
+    full_t = (full_text or "")
+    prev_t = (preview_text or "")
+
+    def get_any(keys: List[str]) -> Optional[str]:
+        for k in keys:
+            v = _internal_kv_value(full_t, k)
+            if v:
+                return v
+        for k in keys:
+            v = _internal_kv_value(prev_t, k)
+            if v:
+                return v
+        return None
+
+    name = get_any(["Name"])
+    released = get_any(["Released Date", "Signing Date"])
+    fsc = get_any(["FSC", "Director of Franchising", "Dir of Franchising"])
+    home_city_state = get_any(["Home City/State", "Home City / State"])
+    state_code = _internal_state_from_city_state(home_city_state or "")
+    lead_source = get_any(["Lead Source"])
+    broker_details = get_any(["Broker Details", "Broker Name"])
+    if lead_source and lead_source.strip().lower() == "broker" and broker_details:
+        lead_source = f"Broker - {broker_details}"
+
+    amount_raw = (
+        get_any(["Amount to Draft Today"])
+        or get_any(["Net Balance"])
+        or get_any(["Remaining Balance"])
+        or get_any(["Deposit Amount"])
+        or get_any(["Amount"])
+        or get_any(["Total Balance"])
+    )
+    amount_usd = _internal_money_to_decimal(amount_raw or "")
+    signing_date = _internal_parse_date_any(released or "")
+
+    return {
+        "franchisee_name": name,
+        "director_of_franchising": fsc,
+        "state_code": state_code,
+        "lead_source": lead_source,
+        "signing_date": signing_date,
+        "amount_usd": amount_usd,
+        "released_date_raw": released,
+        "home_city_state_raw": home_city_state,
+        "broker_details": broker_details,
+        "amount_raw": amount_raw,
+    }
+
+def _internal_announcement_type(subject: str) -> str:
+    s = (subject or "").lower()
+    has_deposit = "deposit" in s
+    has_partial = "partial balance" in s
+    has_balance = "balance" in s
+    out: List[str] = []
+    if has_deposit:
+        out.append("DEPOSIT")
+    if has_partial:
+        out.append("PARTIAL BALANCE")
+    elif has_balance:
+        out.append("BALANCE")
+    return " + ".join(out) if out else "OTHER"
+
+def _internal_brand_from_subject(subject: str) -> Optional[str]:
+    s = (subject or "").lower()
+    if s.startswith("trublue"):
+        return "TB"
+    if s.startswith("caring transitions"):
+        return "CT"
+    if s.startswith("growth coach"):
+        return "GC"
+    return None
+
+def _internal_franchisee_id_from_subject(subject: str) -> Optional[str]:
+    if not subject:
+        return None
+    parts = subject.split(" - ")
+    last = parts[-1].strip() if parts else ""
+    m = re.search(r"\b(\d{3,})\b", last)
+    return m.group(1) if m else last or None
+
+def _internal_stable_raw_id(msg: dict, body_text: str) -> str:
+    imid = (msg.get("internetMessageId") or "").strip()
+    if imid:
+        return imid
+    gid = (msg.get("id") or "").strip()
+    if gid:
+        return gid
+    sender = (((msg.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+    received = (msg.get("receivedDateTime") or "")
+    subject = (msg.get("subject") or "")
+    base = f"{sender}|{received}|{subject}|{(body_text or '')[:200]}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def _emails_to_json(recip_list: Any) -> str:
+    out: List[str] = []
+    if isinstance(recip_list, list):
+        for r in recip_list:
+            addr = (((r or {}).get("emailAddress") or {}).get("address") or "").strip()
+            if addr:
+                out.append(addr)
+    return json.dumps(out, ensure_ascii=False)
+
+def _emails_to_list(recip_list: Any) -> List[str]:
+    out: List[str] = []
+    if isinstance(recip_list, list):
+        for r in recip_list:
+            addr = (((r or {}).get("emailAddress") or {}).get("address") or "").strip()
+            if addr:
+                out.append(addr)
+    return out
 
 gv_USER_AGENT   = "TerritoryChecks/3.3"
 gv_HTTP_TIMEOUT = 60
@@ -614,7 +824,29 @@ def delete_week_slice(dataset: str, table: str, run_date_from: date, run_date_to
         ]
     )
     gv_LOG.info("Deleting existing week slice from %s for run_date_from=%s, run_date_to=%s", table_id, run_date_from, run_date_to)
-    res = client.query(sql, job_config=job_config).result()
+    res = client.query(sql, job_config=job_config, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("Deleted %s rows from %s for the given week slice.", res.num_dml_affected_rows, table_id)
+
+def delete_week_slice_by_received_datetime(dataset: str, table: str, start_dt: datetime, end_dt: datetime) -> None:
+    if not gv_BQ_PROJECT:
+        gv_LOG.info("BQ_PROJECT not set; skipping delete-week-slice for %s.%s", dataset, table)
+        return
+
+    table_id = f"{gv_BQ_PROJECT}.{dataset}.{table}"
+    client = bq_client()
+    sql = f"""
+        DELETE FROM `{table_id}`
+        WHERE received_datetime >= @start_dt
+          AND received_datetime <  @end_dt
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start_dt", "TIMESTAMP", start_dt),
+            bigquery.ScalarQueryParameter("end_dt",   "TIMESTAMP", end_dt),
+        ]
+    )
+    gv_LOG.info("Deleting existing week slice from %s for received_datetime between %s and %s", table_id, start_dt, end_dt)
+    res = client.query(sql, job_config=job_config, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Deleted %s rows from %s for the given week slice.", res.num_dml_affected_rows, table_id)
 
 # ============================ Path helper for GCS =============================
@@ -813,6 +1045,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
 
     lv_details_rows: List[dict] = []
     lv_audit_rows:   List[dict] = []
+    lv_internal_candidates: List[dict] = []
 
     for lv_folder in lv_client.list_all_folders():
         lv_fid   = lv_folder["id"]
@@ -826,6 +1059,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_body_preview = (lv_msg.get("bodyPreview") or "").strip()
 
             lv_full_text: Optional[str] = None
+            lv_full_html: Optional[str] = None
             lv_attempted_full_body_fetch: bool = False
             lv_fetched_full_body: bool = False
 
@@ -858,6 +1092,34 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             # Keep them in Audit with a clear skipped_reason.
             if not lv_skipped_reason and is_internal_announcement(lv_sender, lv_sender_name, lv_subj, lv_body_preview):
                 lv_skipped_reason = "Internal Announcement"
+                _ensure_full_text_once()
+                internal_fields = _internal_parse_fields(lv_body_preview, lv_full_text or "")
+                raw_id = _internal_stable_raw_id(lv_msg, lv_full_text or "")
+                lv_internal_candidates.append({
+                    "raw_id": raw_id,
+                    "source_system": "outlook",
+                    "mailbox": gv_MASTER_MAILBOX,
+                    "ingested_at": lv_run_ts,
+                    "pipeline_run_id": None,
+                    "parser_version": gv_INTERNAL_PARSER_VERSION,
+                    "received_datetime": lv_msg.get("receivedDateTime", ""),
+                    "sender_email": lv_sender,
+                    "subject": lv_subj,
+                    "web_link": lv_msg.get("webLink", ""),
+                    "body_content_type": "html" if lv_full_html else "text",
+                    "body_html": lv_full_html or "",
+                    "body_text": lv_full_text or "",
+                    "body_preview": lv_body_preview,
+                    "to_emails": _emails_to_list(lv_msg.get("toRecipients")),
+                    "cc_emails": _emails_to_list(lv_msg.get("ccRecipients")),
+                    "has_attachments": lv_msg.get("hasAttachments", False),
+                    "skipped_reason": "",
+                    "extracted_fields_json": json.dumps(internal_fields, ensure_ascii=False),
+                    "brand": _internal_brand_from_subject(lv_subj),
+                    "franchisee_id": _internal_franchisee_id_from_subject(lv_subj),
+                    "announcement_type": _internal_announcement_type(lv_subj),
+                    **internal_fields,
+                })
 
             lv_broker_subj = broker_from_subject(lv_subj)
             lv_broker_fw   = None if lv_broker_subj else forwarded_broker_from_text(lv_body_preview)
@@ -865,17 +1127,19 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_chosen_broker = lv_broker_subj or lv_broker_fw or lv_broker_dom
 
             def _ensure_full_text_once() -> None:
-                nonlocal lv_full_text, lv_attempted_full_body_fetch, lv_fetched_full_body
+                nonlocal lv_full_text, lv_full_html, lv_attempted_full_body_fetch, lv_fetched_full_body
                 if lv_attempted_full_body_fetch:
                     return
                 lv_attempted_full_body_fetch = True
                 try:
                     lv_body_html = lv_client.fetch_full_body(lv_msg["id"])
+                    lv_full_html = lv_body_html
                     lv_full_text = _html_to_text(lv_body_html)
                     lv_fetched_full_body = True
                 except Exception as lv_e:
                     gv_LOG.debug("Full body fetch failed for %s: %s", lv_msg.get("id"), lv_e)
                     lv_full_text = None
+                    lv_full_html = None
                     lv_fetched_full_body = False
 
             if lv_chosen_broker == "Others":
@@ -953,6 +1217,149 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             })
 
     lv_df = pd.DataFrame(lv_details_rows)
+
+    # ================= Internal Announcements (Balances/Deposits) ==================
+    internal_raw_local_path: Optional[str] = None
+    internal_final_local_path: Optional[str] = None
+    internal_xlsx_local_path: Optional[str] = None
+    internal_raw_gcs_uri: Optional[str] = None
+    internal_final_gcs_uri: Optional[str] = None
+    internal_xlsx_gcs_uri: Optional[str] = None
+
+    if lv_internal_candidates:
+        gv_LOG.info("Internal announcements found: %d", len(lv_internal_candidates))
+        df_internal_raw_full = pd.DataFrame(lv_internal_candidates)
+        # Keep only bronze-table columns in RAW export (BQ)
+        raw_cols = [
+            "raw_id","source_system","mailbox","ingested_at","pipeline_run_id","parser_version",
+            "received_datetime","sender_email","subject","web_link","body_content_type","body_html",
+            "body_text","body_preview","to_emails","cc_emails","has_attachments","skipped_reason",
+            "extracted_fields_json",
+        ]
+        df_internal_raw = df_internal_raw_full.reindex(columns=[c for c in raw_cols if c in df_internal_raw_full.columns])
+
+        # skipped_reason logic
+        def _is_re_fw_subject(s: str) -> bool:
+            return bool(re.match(r"(?i)^\s*(re|fw|fwd)\s*:", (s or "").strip()))
+
+        def _is_threaded(text: str) -> bool:
+            t = (text or "").lower()
+            markers = [
+                "-----original message-----",
+                "\nfrom:",
+                "\nsent:",
+                "\nto:",
+                "\ncc:",
+                "\nsubject:",
+                "\nwrote:",
+                "\n>",
+            ]
+            return any(m in t for m in markers)
+
+        df_internal_raw["skipped_reason"] = df_internal_raw.apply(
+            lambda r: "RE_FWD_EMAIL" if _is_re_fw_subject(r.get("subject", "")) else
+            ("THREAD_EMAIL" if _is_threaded(r.get("body_text", "")) or _is_threaded(r.get("body_preview", "")) else
+             ("NOT_TEMPLATE" if (not _internal_looks_like_template(r.get("body_text", "")) and not _internal_looks_like_template(r.get("body_preview", ""))) else "")),
+            axis=1
+        )
+
+        # Superseded rule: if any RE/FW exists for an ID, suppress clean originals for FINAL
+        if "franchisee_id" not in df_internal_raw.columns:
+            df_internal_raw["franchisee_id"] = ""
+        superseded_ids = set(
+            df_internal_raw.loc[df_internal_raw["skipped_reason"] == "RE_FWD_EMAIL", "franchisee_id"]
+            .dropna().astype(str).tolist()
+        )
+        if superseded_ids:
+            mask_clean = (df_internal_raw["skipped_reason"] == "") & (df_internal_raw["franchisee_id"].astype(str).isin(superseded_ids))
+            df_internal_raw.loc[mask_clean, "skipped_reason"] = "SUPERSEDED_BY_RE"
+
+        # FINAL = only clean rows, latest per franchisee_id
+        df_internal_final = df_internal_raw_full[df_internal_raw_full["skipped_reason"] == ""].copy()
+        if not df_internal_final.empty:
+            if "franchisee_id" not in df_internal_final.columns:
+                df_internal_final["franchisee_id"] = ""
+            df_internal_final["received_datetime"] = pd.to_datetime(df_internal_final["received_datetime"], errors="coerce")
+            df_internal_final = df_internal_final.sort_values(by=["franchisee_id", "received_datetime"])
+            df_internal_final = df_internal_final.drop_duplicates(subset=["franchisee_id"], keep="last")
+
+        # Add run metadata for Silver (as ISO strings for JSONL)
+        df_internal_final["run_date_from"] = lv_run_date_from.isoformat()
+        df_internal_final["run_date_to"]   = lv_run_date_to.isoformat()
+        df_internal_final["run_timestamp"] = lv_run_ts.isoformat()
+
+        final_cols = [
+            "raw_id","received_datetime","ingested_at","brand","director_of_franchising",
+            "franchisee_name","franchisee_id","state_code","lead_source",
+            "announcement_type","signing_date","amount_usd",
+            "run_date_from","run_date_to","run_timestamp",
+        ]
+        df_internal_final = df_internal_final[[c for c in final_cols if c in df_internal_final.columns]]
+
+        # Excel (two sheets)
+        internal_raw_filename   = f"internal_announcements_raw_{lv_file_label}.jsonl"
+        internal_final_filename = f"internal_announcements_final_{lv_file_label}.jsonl"
+        internal_xlsx_filename  = f"balances_deposits_{lv_file_label}.xlsx"
+
+        internal_raw_local_path   = os.path.join(gv_OUT_DIR, internal_raw_filename)
+        internal_final_local_path = os.path.join(gv_OUT_DIR, internal_final_filename)
+        internal_xlsx_local_path  = os.path.join(gv_OUT_DIR, internal_xlsx_filename)
+
+        # RAW as JSONL (preserves ARRAY fields) — enforce bronze schema columns only
+        raw_cols = [
+            "raw_id","source_system","mailbox","ingested_at","pipeline_run_id","parser_version",
+            "received_datetime","sender_email","subject","web_link","body_content_type","body_html",
+            "body_text","body_preview","to_emails","cc_emails","has_attachments","skipped_reason",
+            "extracted_fields_json",
+        ]
+        df_internal_raw = df_internal_raw.reindex(columns=[c for c in raw_cols if c in df_internal_raw.columns])
+        # Ensure timestamps are ISO strings for JSONL (avoid epoch overflow)
+        for _col in ["ingested_at", "received_datetime"]:
+            if _col in df_internal_raw.columns:
+                _dt_col = pd.to_datetime(df_internal_raw[_col], errors="coerce", utc=True)
+                df_internal_raw[_col] = _dt_col.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        df_internal_raw.to_json(internal_raw_local_path, orient="records", lines=True, force_ascii=False)
+        # Ensure date/timestamps are ISO strings for JSONL
+        if "received_datetime" in df_internal_final.columns:
+            _dt = pd.to_datetime(df_internal_final["received_datetime"], errors="coerce", utc=True)
+            df_internal_final["received_datetime"] = _dt.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if "ingested_at" in df_internal_final.columns:
+            _dt = pd.to_datetime(df_internal_final["ingested_at"], errors="coerce", utc=True)
+            df_internal_final["ingested_at"] = _dt.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        df_internal_final.to_json(internal_final_local_path, orient="records", lines=True, force_ascii=False)
+
+        # Make Excel-safe (strip tz-aware datetimes)
+        for _df in (df_internal_raw, df_internal_final):
+            for _col in ["received_datetime", "ingested_at", "run_timestamp"]:
+                if _col in _df.columns:
+                    _df[_col] = pd.to_datetime(_df[_col], errors="coerce")
+                    try:
+                        _df[_col] = _df[_col].dt.tz_localize(None)
+                    except Exception:
+                        pass
+
+        with pd.ExcelWriter(internal_xlsx_local_path, engine="openpyxl") as xlw:
+            raw_excel = df_internal_raw[[c for c in INTERNAL_EXCEL_RAW_COLS if c in df_internal_raw.columns]]
+            final_excel = df_internal_final[[c for c in INTERNAL_EXCEL_FINAL_COLS if c in df_internal_final.columns]]
+            raw_excel.to_excel(xlw, sheet_name="RAW", index=False)
+            final_excel.to_excel(xlw, sheet_name="FINAL", index=False)
+
+        internal_prefix = join_prefix(gv_GCS_PREFIX_INTERNAL_FINAL, lv_year, lv_month)
+        internal_raw_gcs_uri   = upload_file_to_gcs(internal_raw_local_path, internal_prefix)
+        internal_final_gcs_uri = upload_file_to_gcs(internal_final_local_path, internal_prefix)
+        internal_xlsx_gcs_uri  = upload_file_to_gcs(internal_xlsx_local_path, internal_prefix)
+        gv_LOG.info("Uploaded internal RAW CSV to GCS: %s", internal_raw_gcs_uri)
+        gv_LOG.info("Uploaded internal FINAL CSV to GCS: %s", internal_final_gcs_uri)
+        gv_LOG.info("Uploaded internal XLSX to GCS: %s", internal_xlsx_gcs_uri)
+
+        # Load to BigQuery (raw -> bronze, final -> silver)
+        if internal_raw_gcs_uri:
+            delete_week_slice_by_received_datetime(gv_BQ_DATASET_BRONZE, gv_BQ_TABLE_INTERNAL_BRONZE, lv_start_dt, lv_end_excl)
+            load_jsonl_to_bigquery(internal_raw_gcs_uri, gv_BQ_DATASET_BRONZE, gv_BQ_TABLE_INTERNAL_BRONZE)
+
+        if internal_final_gcs_uri:
+            delete_week_slice_by_received_datetime(gv_BQ_DATASET_SILVER, gv_BQ_TABLE_INTERNAL_SILVER, lv_start_dt, lv_end_excl)
+            load_jsonl_to_bigquery(internal_final_gcs_uri, gv_BQ_DATASET_SILVER, gv_BQ_TABLE_INTERNAL_SILVER)
 
     if lv_df.empty:
         gv_LOG.info("No messages in the window; writing an empty workbook with all brand sheets.")
@@ -1112,6 +1519,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         "excel_gcs_uri"   : excel_gcs_uri,
         "raw_local_path"  : raw_local_path,
         "raw_gcs_uri"     : raw_gcs_uri,
+        "internal_raw_local_path"  : internal_raw_local_path,
+        "internal_final_local_path": internal_final_local_path,
+        "internal_xlsx_local_path" : internal_xlsx_local_path,
+        "internal_raw_gcs_uri"     : internal_raw_gcs_uri,
+        "internal_final_gcs_uri"   : internal_final_gcs_uri,
+        "internal_xlsx_gcs_uri"    : internal_xlsx_gcs_uri,
     }
 
 # ------------------------------- Writer ---------------------------------------
@@ -1239,6 +1652,46 @@ def upload_file_to_gcs(local_path: str, prefix: str) -> Optional[str]:
     return gcs_uri
 
 def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
+    if table == gv_BQ_TABLE_INTERNAL_BRONZE:
+        return [
+            bigquery.SchemaField("raw_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("source_system", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("mailbox", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("ingested_at", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("pipeline_run_id", "STRING"),
+            bigquery.SchemaField("parser_version", "STRING"),
+            bigquery.SchemaField("received_datetime", "TIMESTAMP"),
+            bigquery.SchemaField("sender_email", "STRING"),
+            bigquery.SchemaField("subject", "STRING"),
+            bigquery.SchemaField("web_link", "STRING"),
+            bigquery.SchemaField("body_content_type", "STRING"),
+            bigquery.SchemaField("body_html", "STRING"),
+            bigquery.SchemaField("body_text", "STRING"),
+            bigquery.SchemaField("body_preview", "STRING"),
+            bigquery.SchemaField("to_emails", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("cc_emails", "STRING", mode="REPEATED"),
+            bigquery.SchemaField("has_attachments", "BOOL"),
+            bigquery.SchemaField("skipped_reason", "STRING"),
+            bigquery.SchemaField("extracted_fields_json", "JSON"),
+        ]
+    if table == gv_BQ_TABLE_INTERNAL_SILVER:
+        return [
+            bigquery.SchemaField("raw_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("received_datetime", "TIMESTAMP"),
+            bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+            bigquery.SchemaField("brand", "STRING"),
+            bigquery.SchemaField("director_of_franchising", "STRING"),
+            bigquery.SchemaField("franchisee_name", "STRING"),
+            bigquery.SchemaField("franchisee_id", "STRING"),
+            bigquery.SchemaField("state_code", "STRING"),
+            bigquery.SchemaField("lead_source", "STRING"),
+            bigquery.SchemaField("announcement_type", "STRING"),
+            bigquery.SchemaField("signing_date", "DATE"),
+            bigquery.SchemaField("amount_usd", "NUMERIC"),
+            bigquery.SchemaField("run_date_from", "DATE"),
+            bigquery.SchemaField("run_date_to", "DATE"),
+            bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
+        ]
     if table == gv_BQ_TABLE_TERRITORY:
         return [
             bigquery.SchemaField("brand_name", "STRING"),
@@ -1316,8 +1769,33 @@ def load_csv_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     )
 
     gv_LOG.info("Starting BigQuery load from %s to %s", gcs_uri, table_id)
-    result = client.load_table_from_uri(gcs_uri, table_id, job_config=job_config).result()
+    result = client.load_table_from_uri(gcs_uri, table_id, job_config=job_config, location=gv_BQ_LOCATION).result()
     gv_LOG.info("BigQuery load complete: %d rows loaded to %s", result.output_rows, table_id)
+
+def load_jsonl_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
+    if not gv_BQ_PROJECT:
+        gv_LOG.info("BQ_PROJECT not set; skipping BigQuery load for %s", gcs_uri)
+        return
+
+    table_id = f"{gv_BQ_PROJECT}.{dataset}.{table}"
+    client = bigquery.Client(project=gv_BQ_PROJECT)
+
+    schema = _bq_schema_for_table(table)
+    if not schema:
+        raise SystemExit(f"No schema configured for table={table}. Update _bq_schema_for_table().")
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        autodetect=False,
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        ignore_unknown_values=False,
+        max_bad_records=0,
+    )
+
+    gv_LOG.info("Starting BigQuery JSON load from %s to %s", gcs_uri, table_id)
+    result = client.load_table_from_uri(gcs_uri, table_id, job_config=job_config, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("BigQuery JSON load complete: %d rows loaded to %s", result.output_rows, table_id)
 
 # ================================= Entrypoint =================================
 def main() -> None:
@@ -1345,6 +1823,9 @@ def main() -> None:
     gv_LOG.info("Excel GCS  : %s", result.get("excel_gcs_uri"))
     gv_LOG.info("Raw local  : %s", result.get("raw_local_path"))
     gv_LOG.info("Raw GCS    : %s", result.get("raw_gcs_uri"))
+    gv_LOG.info("Internal RAW GCS    : %s", result.get("internal_raw_gcs_uri"))
+    gv_LOG.info("Internal FINAL GCS  : %s", result.get("internal_final_gcs_uri"))
+    gv_LOG.info("Internal XLSX GCS   : %s", result.get("internal_xlsx_gcs_uri"))
 
 if __name__ == "__main__":
     main()
