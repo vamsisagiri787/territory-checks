@@ -124,7 +124,8 @@ INTERNAL_EXCEL_FINAL_COLS = [
     "state_code",
     "lead_source",
     "announcement_type",
-    "signing_date",
+    "balance_deposit_date",
+    "closed_sale_date",
     "amount_usd",
 ]
 
@@ -221,23 +222,26 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     if lead_source and lead_source.strip().lower() == "broker" and broker_details:
         lead_source = f"Broker - {broker_details}"
 
+    # Prefer Net Balance over Amount to Draft
     amount_raw = (
-        get_any(["Amount to Draft Today"])
-        or get_any(["Net Balance"])
+        get_any(["Net Balance"])
+        or get_any(["Amount to Draft Today"])
         or get_any(["Remaining Balance"])
         or get_any(["Deposit Amount"])
         or get_any(["Amount"])
         or get_any(["Total Balance"])
     )
     amount_usd = _internal_money_to_decimal(amount_raw or "")
-    signing_date = _internal_parse_date_any(released or "")
+    balance_deposit_date = _internal_parse_date_any(released or "")
+    closed_sale_date = _internal_parse_date_any(get_any(["Closed Sale Date"]) or "")
 
     return {
         "franchisee_name": name,
         "director_of_franchising": fsc,
         "state_code": state_code,
         "lead_source": lead_source,
-        "signing_date": signing_date,
+        "balance_deposit_date": balance_deposit_date,
+        "closed_sale_date": closed_sale_date,
         "amount_usd": amount_usd,
         "released_date_raw": released,
         "home_city_state_raw": home_city_state,
@@ -827,17 +831,28 @@ def delete_week_slice(dataset: str, table: str, run_date_from: date, run_date_to
     res = client.query(sql, job_config=job_config, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Deleted %s rows from %s for the given week slice.", res.num_dml_affected_rows, table_id)
 
-def delete_week_slice_by_received_datetime(dataset: str, table: str, start_dt: datetime, end_dt: datetime) -> None:
+def delete_week_slice_by_received_datetime(
+    dataset: str,
+    table: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    exclude_manual: bool = False,
+) -> None:
     if not gv_BQ_PROJECT:
         gv_LOG.info("BQ_PROJECT not set; skipping delete-week-slice for %s.%s", dataset, table)
         return
 
     table_id = f"{gv_BQ_PROJECT}.{dataset}.{table}"
     client = bq_client()
+    extra_filter = ""
+    if exclude_manual:
+        extra_filter = "AND (raw_id IS NULL OR raw_id NOT LIKE 'manual-%')"
+
     sql = f"""
         DELETE FROM `{table_id}`
         WHERE received_datetime >= @start_dt
           AND received_datetime <  @end_dt
+          {extra_filter}
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -845,7 +860,13 @@ def delete_week_slice_by_received_datetime(dataset: str, table: str, start_dt: d
             bigquery.ScalarQueryParameter("end_dt",   "TIMESTAMP", end_dt),
         ]
     )
-    gv_LOG.info("Deleting existing week slice from %s for received_datetime between %s and %s", table_id, start_dt, end_dt)
+    gv_LOG.info(
+        "Deleting existing week slice from %s for received_datetime between %s and %s (exclude_manual=%s)",
+        table_id,
+        start_dt,
+        end_dt,
+        exclude_manual,
+    )
     res = client.query(sql, job_config=job_config, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Deleted %s rows from %s for the given week slice.", res.num_dml_affected_rows, table_id)
 
@@ -1274,14 +1295,37 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             mask_clean = (df_internal_raw["skipped_reason"] == "") & (df_internal_raw["franchisee_id"].astype(str).isin(superseded_ids))
             df_internal_raw.loc[mask_clean, "skipped_reason"] = "SUPERSEDED_BY_RE"
 
-        # FINAL = only clean rows, latest per franchisee_id
+        # FINAL = only clean rows, merge fields across emails by franchisee_id
         df_internal_final = df_internal_raw_full[df_internal_raw_full["skipped_reason"] == ""].copy()
         if not df_internal_final.empty:
             if "franchisee_id" not in df_internal_final.columns:
                 df_internal_final["franchisee_id"] = ""
-            df_internal_final["received_datetime"] = pd.to_datetime(df_internal_final["received_datetime"], errors="coerce")
-            df_internal_final = df_internal_final.sort_values(by=["franchisee_id", "received_datetime"])
-            df_internal_final = df_internal_final.drop_duplicates(subset=["franchisee_id"], keep="last")
+            if "franchisee_name" not in df_internal_final.columns:
+                df_internal_final["franchisee_name"] = ""
+
+            df_internal_final["received_datetime"] = pd.to_datetime(
+                df_internal_final["received_datetime"], errors="coerce"
+            )
+            # Build merge key: franchisee_id -> franchisee_name -> raw_id
+            fid = df_internal_final["franchisee_id"].fillna("").astype(str).str.strip()
+            fname = df_internal_final["franchisee_name"].fillna("").astype(str).str.strip()
+            rid = df_internal_final["raw_id"].fillna("").astype(str).str.strip()
+            df_internal_final["_merge_key"] = fid
+            df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = fname
+            df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = rid
+
+            def _last_non_empty(series: pd.Series):
+                s = series
+                s = s.replace("", pd.NA)
+                s = s.dropna()
+                return s.iloc[-1] if len(s) > 0 else pd.NA
+
+            df_internal_final = (
+                df_internal_final.sort_values(by=["_merge_key", "received_datetime"])
+                .groupby("_merge_key", dropna=False)
+                .apply(lambda g: g.apply(_last_non_empty))
+                .reset_index(drop=True)
+            )
 
         # Add run metadata for Silver (as ISO strings for JSONL)
         df_internal_final["run_date_from"] = lv_run_date_from.isoformat()
@@ -1291,7 +1335,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         final_cols = [
             "raw_id","received_datetime","ingested_at","brand","director_of_franchising",
             "franchisee_name","franchisee_id","state_code","lead_source",
-            "announcement_type","signing_date","amount_usd",
+            "announcement_type","balance_deposit_date","closed_sale_date","amount_usd",
             "run_date_from","run_date_to","run_timestamp",
         ]
         df_internal_final = df_internal_final[[c for c in final_cols if c in df_internal_final.columns]]
@@ -1354,11 +1398,23 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
 
         # Load to BigQuery (raw -> bronze, final -> silver)
         if internal_raw_gcs_uri:
-            delete_week_slice_by_received_datetime(gv_BQ_DATASET_BRONZE, gv_BQ_TABLE_INTERNAL_BRONZE, lv_start_dt, lv_end_excl)
+            delete_week_slice_by_received_datetime(
+                gv_BQ_DATASET_BRONZE,
+                gv_BQ_TABLE_INTERNAL_BRONZE,
+                lv_start_dt,
+                lv_end_excl,
+                exclude_manual=True,
+            )
             load_jsonl_to_bigquery(internal_raw_gcs_uri, gv_BQ_DATASET_BRONZE, gv_BQ_TABLE_INTERNAL_BRONZE)
 
         if internal_final_gcs_uri:
-            delete_week_slice_by_received_datetime(gv_BQ_DATASET_SILVER, gv_BQ_TABLE_INTERNAL_SILVER, lv_start_dt, lv_end_excl)
+            delete_week_slice_by_received_datetime(
+                gv_BQ_DATASET_SILVER,
+                gv_BQ_TABLE_INTERNAL_SILVER,
+                lv_start_dt,
+                lv_end_excl,
+                exclude_manual=True,
+            )
             load_jsonl_to_bigquery(internal_final_gcs_uri, gv_BQ_DATASET_SILVER, gv_BQ_TABLE_INTERNAL_SILVER)
 
     if lv_df.empty:
@@ -1686,7 +1742,8 @@ def _bq_schema_for_table(table: str) -> List[bigquery.SchemaField]:
             bigquery.SchemaField("state_code", "STRING"),
             bigquery.SchemaField("lead_source", "STRING"),
             bigquery.SchemaField("announcement_type", "STRING"),
-            bigquery.SchemaField("signing_date", "DATE"),
+            bigquery.SchemaField("balance_deposit_date", "DATE"),
+            bigquery.SchemaField("closed_sale_date", "DATE"),
             bigquery.SchemaField("amount_usd", "NUMERIC"),
             bigquery.SchemaField("run_date_from", "DATE"),
             bigquery.SchemaField("run_date_to", "DATE"),
