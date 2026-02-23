@@ -175,14 +175,20 @@ def _internal_state_from_city_state(v: str) -> Optional[str]:
 def _internal_kv_value(text: str, key: str) -> Optional[str]:
     if not text or not key:
         return None
-    k = re.escape(key.strip())
+    # Normalize common unicode spaces from Outlook HTML->text conversion.
+    t = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", t)
+    key_words = [w for w in re.split(r"\s+", key.strip()) if w]
+    if not key_words:
+        return None
+    k = r"\s+".join(re.escape(w) for w in key_words)
     pat = rf"(?im)^\s*{k}\s*:?\s*$\s*^\s*(.+?)\s*$"
-    m = re.search(pat, text)
+    m = re.search(pat, t)
     if m:
         v = m.group(1).strip()
         return v if v and v.lower() not in {"n/a", "na", "-"} else None
     pat2 = rf"(?im)^\s*{k}\s*:?\s*(.+?)\s*$"
-    m2 = re.search(pat2, text)
+    m2 = re.search(pat2, t)
     if m2:
         v = m2.group(1).strip()
         return v if v and v.lower() not in {"n/a", "na", "-"} else None
@@ -212,7 +218,18 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
                 return v
         return None
 
-    name = get_any(["Name"])
+    # Prefer explicit correction notes when present in reply threads.
+    correction_name = None
+    correction_text = full_t or prev_t
+    if correction_text:
+        m_corr = re.search(
+            r"(?is)\bnew\s+franchisee(?:'s|s)?\s+(?:are|is)\s+(.+?)(?:[.!?\n]|$)",
+            correction_text,
+        )
+        if m_corr:
+            correction_name = (m_corr.group(1) or "").strip(" .;:-")
+
+    name = correction_name or get_any(["Name", "Buyer Name"])
     released = get_any(["Released Date", "Signing Date"])
     fsc = get_any(["FSC", "Director of Franchising", "Dir of Franchising"])
     home_city_state = get_any(["Home City/State", "Home City / State"])
@@ -221,11 +238,14 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     broker_details = get_any(["Broker Details", "Broker Name"])
     if lead_source and lead_source.strip().lower() == "broker" and broker_details:
         lead_source = f"Broker - {broker_details}"
+    brand_raw = get_any(["Franchise Brand", "For Company"]) or ""
+    brand_code = _internal_brand_from_subject(brand_raw)
 
-    # Prefer Net Balance over Amount to Draft
+    # Always track Net Balance first.
     amount_raw = (
         get_any(["Net Balance"])
         or get_any(["Amount to Draft Today"])
+        or get_any(["ROFR Fee"])
         or get_any(["Remaining Balance"])
         or get_any(["Deposit Amount"])
         or get_any(["Amount"])
@@ -236,6 +256,7 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     closed_sale_date = _internal_parse_date_any(get_any(["Closed Sale Date"]) or "")
 
     return {
+        "brand": brand_code,
         "franchisee_name": name,
         "director_of_franchising": fsc,
         "state_code": state_code,
@@ -249,8 +270,10 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
         "amount_raw": amount_raw,
     }
 
-def _internal_announcement_type(subject: str) -> str:
+def _internal_announcement_type(subject: str, body_preview: str = "", body_text: str = "") -> str:
     s = (subject or "").lower()
+    if "rofr" in s:
+        return "ROFR"
     has_deposit = "deposit" in s
     has_partial = "partial balance" in s
     has_balance = "balance" in s
@@ -261,25 +284,158 @@ def _internal_announcement_type(subject: str) -> str:
         out.append("PARTIAL BALANCE")
     elif has_balance:
         out.append("BALANCE")
-    return " + ".join(out) if out else "OTHER"
+    if out:
+        return " + ".join(out)
+
+    b = f"{body_preview or ''} {body_text or ''}".lower()
+    if "rofr" in b:
+        return "ROFR"
+    if "training approved" in b and "deal closed" in b:
+        return "Training Approved/Deal Closed"
+    if "transfer complete" in b:
+        return "Transfer Complete"
+    if "additional franchise purchase complete" in b:
+        return "Additional Franchise Purchase Complete"
+    return "OTHER"
+
+def _internal_action_announcement_type(subject: str, body_text: str = "") -> Optional[str]:
+    s = (subject or "").strip()
+    if not s:
+        return None
+    # Prefer explicit ACTION label from body when present.
+    body_label = _internal_kv_value(body_text or "", "ACTION")
+    if body_label:
+        return body_label.strip()
+    sl = s.lower()
+    if "transfer complete" in sl:
+        return "Transfer Complete"
+    if re.search(r"training approved.*deal closed", sl):
+        return "Training Approved/Deal Closed"
+    if "deal closed" in sl:
+        return "Deal Closed"
+    if "additional franchise purchase complete" in sl:
+        return "Additional Franchise Purchase Complete"
+    if "action" in sl:
+        return s
+    return None
+
+def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
+    subject_ids: List[str] = []
+    seller_ids: List[str] = []
+    franchise_ids: List[str] = []
+    current_ids: List[str] = []
+
+    def _push(text: str, bucket: List[str]) -> None:
+        t = text or ""
+        for m in re.findall(r"\b(\d{3,}[A-Za-z]{2,}[A-Za-z0-9]*)\b", t):
+            if m not in bucket:
+                bucket.append(m)
+        for m in re.findall(r"\b(\d{3,})\b", t):
+            if m not in bucket:
+                bucket.append(m)
+
+    _push(subject or "", subject_ids)
+    _push((subject or "").split(" - ")[-1], subject_ids)
+
+    # For transfer-style mails, prioritize seller franchise IDs only.
+    for k in ["Seller FA#", "Seller FA", "FA#"]:
+        v = _internal_kv_value(body_text or "", k)
+        if v:
+            _push(v, seller_ids)
+    if seller_ids:
+        return seller_ids
+
+    # Next best: explicit franchise number fields.
+    v = _internal_kv_value(body_text or "", "Franchise Number")
+    if v:
+        _push(v, franchise_ids)
+    if franchise_ids:
+        return franchise_ids
+
+    # Fallback only when no seller/franchise-number IDs found.
+    for k in ["Current Franchise", "Current Franchises", "Current Franchisee"]:
+        v = _internal_kv_value(body_text or "", k)
+        if v:
+            _push(v, current_ids)
+    if current_ids:
+        return current_ids
+
+    return subject_ids
+
+def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Optional[str]:
+    t = str(body_text or "")
+    t = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", t)
+
+    closed_raw = (
+        _internal_kv_value(t, "TODAY'S DATE")
+        or _internal_kv_value(t, "Today's Date")
+        or _internal_kv_value(t, "TRAINING APPROVED DATE")
+        or _internal_kv_value(t, "Training Approved Date")
+        or _internal_kv_value(t, "Transfer Effective Date")
+        or _internal_kv_value(t, "Effective Date")
+        or _internal_kv_value(t, "Franchise Agreement-Effective Date")
+        or _internal_kv_value(t, "Closed Sale Date")
+    )
+    if not closed_raw:
+        m = re.search(r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", t)
+        if m:
+            closed_raw = m.group(1)
+    parsed = _internal_parse_date_any(closed_raw or "")
+    if parsed:
+        return parsed
+    if pd.notna(received_datetime):
+        try:
+            return pd.to_datetime(received_datetime).date().isoformat()
+        except Exception:
+            return None
+    return None
 
 def _internal_brand_from_subject(subject: str) -> Optional[str]:
-    s = (subject or "").lower()
-    if s.startswith("trublue"):
+    s = (subject or "").lower().strip()
+    s = re.sub(r"^\s*(re|fw|fwd)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
+    if "trublue" in s:
         return "TB"
-    if s.startswith("caring transitions"):
+    if "caring transitions" in s:
         return "CT"
-    if s.startswith("growth coach"):
+    if "growth coach" in s or "growthcoach" in s:
         return "GC"
+    if "fresh coat" in s or "freshcoat" in s:
+        return "FC"
+    if "pet wants" in s or "petwants" in s:
+        return "PW"
+    return None
+
+def _internal_embedded_subject(text: str) -> Optional[str]:
+    t = str(text or "")
+    m = re.search(r"(?im)^\s*subject\s*:\s*(.+?)\s*$", t)
+    if m:
+        return m.group(1).strip()
     return None
 
 def _internal_franchisee_id_from_subject(subject: str) -> Optional[str]:
     if not subject:
         return None
-    parts = subject.split(" - ")
-    last = parts[-1].strip() if parts else ""
-    m = re.search(r"\b(\d{3,})\b", last)
-    return m.group(1) if m else last or None
+    s = str(subject).strip()
+    # Search across full subject so patterns like
+    # ".... - 36225ROFR - North Tampa" are still captured.
+    m_compound = re.search(r"\b(\d{3,}[A-Za-z]{2,}[A-Za-z0-9]*)\b", s)
+    if m_compound:
+        return m_compound.group(1)
+    m_num = re.search(r"\b(\d{3,})\b", s)
+    if m_num:
+        return m_num.group(1)
+    # Avoid returning free-text location tokens as franchise IDs.
+    return None
+
+def _safe_text(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v).strip()
 
 def _internal_stable_raw_id(msg: dict, body_text: str) -> str:
     imid = (msg.get("internetMessageId") or "").strip()
@@ -1116,6 +1272,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 _ensure_full_text_once()
                 internal_fields = _internal_parse_fields(lv_body_preview, lv_full_text or "")
                 raw_id = _internal_stable_raw_id(lv_msg, lv_full_text or "")
+                embedded_subj = _internal_embedded_subject(lv_full_text or "")
+                effective_subj = embedded_subj or lv_subj
                 lv_internal_candidates.append({
                     "raw_id": raw_id,
                     "source_system": "outlook",
@@ -1136,9 +1294,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     "has_attachments": lv_msg.get("hasAttachments", False),
                     "skipped_reason": "",
                     "extracted_fields_json": json.dumps(internal_fields, ensure_ascii=False),
-                    "brand": _internal_brand_from_subject(lv_subj),
-                    "franchisee_id": _internal_franchisee_id_from_subject(lv_subj),
-                    "announcement_type": _internal_announcement_type(lv_subj),
+                    "brand": _internal_brand_from_subject(effective_subj),
+                    "franchisee_id": _internal_franchisee_id_from_subject(effective_subj),
+                    "announcement_type": _internal_announcement_type(effective_subj, lv_body_preview, lv_full_text or ""),
                     **internal_fields,
                 })
 
@@ -1277,12 +1435,34 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             ]
             return any(m in t for m in markers)
 
-        df_internal_raw["skipped_reason"] = df_internal_raw.apply(
-            lambda r: "RE_FWD_EMAIL" if _is_re_fw_subject(r.get("subject", "")) else
-            ("THREAD_EMAIL" if _is_threaded(r.get("body_text", "")) or _is_threaded(r.get("body_preview", "")) else
-             ("NOT_TEMPLATE" if (not _internal_looks_like_template(r.get("body_text", "")) and not _internal_looks_like_template(r.get("body_preview", ""))) else "")),
-            axis=1
-        )
+        def _skip_reason_internal(r: pd.Series) -> str:
+            subj = r.get("subject", "")
+            body_t = r.get("body_text", "")
+            body_p = r.get("body_preview", "")
+            action_type = _internal_action_announcement_type(subj, body_t or body_p or "")
+            embedded_subj = _internal_embedded_subject(body_t or body_p or "")
+            has_embedded_payload = bool(embedded_subj) and (
+                _internal_looks_like_template(body_t)
+                or _internal_looks_like_template(body_p)
+                or bool(_internal_action_announcement_type(embedded_subj, body_t or body_p or ""))
+            )
+            if action_type and "rofr" in action_type.lower():
+                # Keep in RAW/AUDIT, skip from FINAL/Silver action flow.
+                return "ROFR_ACTION_SKIP"
+            if _is_re_fw_subject(subj):
+                # Allow RE/FW when it carries quoted original template/action content.
+                if has_embedded_payload:
+                    return ""
+                return "RE_FWD_EMAIL"
+            if _is_threaded(body_t) or _is_threaded(body_p):
+                if has_embedded_payload:
+                    return ""
+                return "THREAD_EMAIL"
+            if (not _internal_looks_like_template(body_t)) and (not _internal_looks_like_template(body_p)):
+                return "NOT_TEMPLATE"
+            return ""
+
+        df_internal_raw["skipped_reason"] = df_internal_raw.apply(_skip_reason_internal, axis=1)
 
         # Superseded rule: if any RE/FW exists for an ID, suppress clean originals for FINAL
         if "franchisee_id" not in df_internal_raw.columns:
@@ -1294,6 +1474,49 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
         if superseded_ids:
             mask_clean = (df_internal_raw["skipped_reason"] == "") & (df_internal_raw["franchisee_id"].astype(str).isin(superseded_ids))
             df_internal_raw.loc[mask_clean, "skipped_reason"] = "SUPERSEDED_BY_RE"
+
+        # ACTION mapping for closed_sale_date (ROFR ACTION is intentionally skipped).
+        action_by_id: Dict[str, dict] = {}
+        action_rows: List[dict] = []
+        if not df_internal_raw_full.empty:
+            df_internal_raw_full["received_datetime"] = pd.to_datetime(
+                df_internal_raw_full["received_datetime"], errors="coerce"
+            )
+            for _, r in df_internal_raw_full.sort_values(by=["received_datetime"], na_position="last").iterrows():
+                subj = (r.get("subject") or "")
+                body = (r.get("body_text") or r.get("body_preview") or "")
+                a_type = _internal_action_announcement_type(subj, body)
+                if not a_type:
+                    continue
+                if "rofr" in a_type.lower():
+                    # Keep regular ROFR template rows; skip ACTION-ROFR mapping.
+                    continue
+                a_date = _internal_extract_action_date(body, r.get("received_datetime"))
+                if not a_date:
+                    continue
+                ids = _internal_extract_action_ids(subj, body)
+                a_name = _internal_kv_value(body, "Buyer Name") or _internal_kv_value(body, "Name") or ""
+                a_loc = _internal_kv_value(body, "LOCATION") or _internal_kv_value(body, "Home City/State") or ""
+                a_state = _internal_state_from_city_state(a_loc or "")
+                a_brand = _internal_brand_from_subject(subj) or _safe_text(r.get("brand"))
+                for aid in ids:
+                    aid_s = str(aid).strip()
+                    action_by_id[str(aid).strip()] = {
+                        "closed_sale_date": a_date,
+                        "announcement_type": a_type,
+                        "state_code": a_state,
+                    }
+                    action_rows.append({
+                        "brand": a_brand,
+                        "franchisee_id": aid_s,
+                        "franchisee_name": a_name,
+                        "announcement_type": a_type,
+                        "state_code": a_state,
+                        "closed_sale_date": a_date,
+                        "received_datetime": r.get("received_datetime"),
+                        "ingested_at": r.get("ingested_at"),
+                        "raw_id": r.get("raw_id"),
+                    })
 
         # FINAL = only clean rows, merge fields across emails by franchisee_id
         df_internal_final = df_internal_raw_full[df_internal_raw_full["skipped_reason"] == ""].copy()
@@ -1313,6 +1536,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             df_internal_final["_merge_key"] = fid
             df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = fname
             df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = rid
+            df_internal_pre = df_internal_final.copy()
 
             def _last_non_empty(series: pd.Series):
                 s = series
@@ -1326,6 +1550,83 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 .apply(lambda g: g.apply(_last_non_empty))
                 .reset_index(drop=True)
             )
+
+            # Prefer concrete type over OTHER when grouped rows conflict.
+            if "announcement_type" in df_internal_final.columns:
+                tmp = df_internal_pre.copy()
+                tmp["_atype"] = tmp["announcement_type"].fillna("").astype(str).str.strip()
+                tmp = tmp[tmp["_atype"] != ""]
+                tmp = tmp[tmp["_atype"].str.upper() != "OTHER"]
+                non_other_map = (
+                    tmp.sort_values(by=["_merge_key", "received_datetime"])
+                    .groupby("_merge_key", dropna=False)["_atype"]
+                    .last()
+                    .to_dict()
+                )
+                mask_other = df_internal_final["announcement_type"].fillna("").astype(str).str.strip().str.upper().isin(["", "OTHER"])
+                df_internal_final.loc[mask_other, "announcement_type"] = df_internal_final.loc[mask_other, "_merge_key"].map(non_other_map).fillna(df_internal_final.loc[mask_other, "announcement_type"])
+
+            # Apply ACTION closed-sale/date mapping by franchisee_id only.
+            if action_by_id:
+                def _norm_id(v: Any) -> str:
+                    if v is None:
+                        return ""
+                    try:
+                        if pd.isna(v):
+                            return ""
+                    except Exception:
+                        pass
+                    s = str(v).strip()
+                    m = re.fullmatch(r"(\d+)\.0+", s)
+                    return m.group(1) if m else s
+
+                def _blank(v: Any) -> bool:
+                    if v is None:
+                        return True
+                    try:
+                        if pd.isna(v):
+                            return True
+                    except Exception:
+                        pass
+                    return str(v).strip() == ""
+
+                def _apply_action(row: pd.Series) -> pd.Series:
+                    rid = _norm_id(row.get("franchisee_id"))
+                    if not rid:
+                        return row
+                    ar = action_by_id.get(rid)
+                    if not ar:
+                        return row
+                    at = str(row.get("announcement_type") or "").strip().upper()
+                    ar_t = str(ar.get("announcement_type") or "").strip()
+                    if at in {"", "OTHER"} and ar_t:
+                        row["announcement_type"] = ar_t
+                    if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
+                        row["state_code"] = ar.get("state_code")
+                    if _blank(row.get("closed_sale_date")) and not _blank(ar.get("closed_sale_date")):
+                        row["closed_sale_date"] = ar.get("closed_sale_date")
+                    return row
+
+                df_internal_final = df_internal_final.apply(_apply_action, axis=1)
+
+            # Materialize unmatched ACTION IDs as additional rows (multi-id support).
+            existing_ids = set(
+                df_internal_final.get("franchisee_id", pd.Series([], dtype=str))
+                .astype(str).str.strip().replace("nan", "").tolist()
+            )
+            inserts: List[dict] = []
+            for ar in action_rows:
+                aid = str(ar.get("franchisee_id") or "").strip()
+                if not aid or aid in existing_ids:
+                    continue
+                existing_ids.add(aid)
+                new_row = {c: pd.NA for c in df_internal_final.columns}
+                for c in ["brand", "franchisee_id", "franchisee_name", "announcement_type", "state_code", "closed_sale_date", "received_datetime", "ingested_at", "raw_id"]:
+                    if c in new_row:
+                        new_row[c] = ar.get(c)
+                inserts.append(new_row)
+            if inserts:
+                df_internal_final = pd.concat([df_internal_final, pd.DataFrame(inserts)], ignore_index=True)
 
         # Add run metadata for Silver (as ISO strings for JSONL)
         df_internal_final["run_date_from"] = lv_run_date_from.isoformat()
