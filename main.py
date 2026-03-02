@@ -203,8 +203,29 @@ def _internal_looks_like_template(text: str) -> bool:
     has_amount = ("amount to draft today" in t) or ("amount" in t)
     return must >= 2 and has_amount
 
+def _internal_latest_payload_text(text: str) -> str:
+    """
+    Prefer the latest payload section inside long reply chains.
+    Outlook-style replies often include multiple quoted messages.
+    We scan top-to-bottom and return the first section that looks like
+    a template/action payload; otherwise fallback to whole text.
+    """
+    t = str(text or "")
+    if not t:
+        return t
+    sections = re.split(r"(?im)^\s*from:\s+.+$", t)
+    sections = [s.strip() for s in sections if s and s.strip()]
+    if not sections:
+        return t
+    for s in sections:
+        if _internal_looks_like_template(s):
+            return s
+        if _internal_action_announcement_type(s, s):
+            return s
+    return t
+
 def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
-    full_t = (full_text or "")
+    full_t = _internal_latest_payload_text(full_text or "")
     prev_t = (preview_text or "")
 
     def get_any(keys: List[str]) -> Optional[str]:
@@ -223,16 +244,16 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     correction_text = full_t or prev_t
     if correction_text:
         m_corr = re.search(
-            r"(?is)\bnew\s+franchisee(?:'s|s)?\s+(?:are|is)\s+(.+?)(?:[.!?\n]|$)",
+            r"(?is)\bnew\s+franchisee(?:['’]s|s)?\s+(?:are|is)\s+(.+?)(?:[.!?\n]|$)",
             correction_text,
         )
         if m_corr:
             correction_name = (m_corr.group(1) or "").strip(" .;:-")
 
-    name = correction_name or get_any(["Name", "Buyer Name"])
+    name = correction_name or get_any(["Name", "Buyer Name", "Contact Name"])
     released = get_any(["Released Date", "Signing Date"])
     fsc = get_any(["FSC", "Director of Franchising", "Dir of Franchising"])
-    home_city_state = get_any(["Home City/State", "Home City / State"])
+    home_city_state = get_any(["Home City/State", "Home City / State", "City/State", "City / State"])
     state_code = _internal_state_from_city_state(home_city_state or "")
     lead_source = get_any(["Lead Source"])
     broker_details = get_any(["Broker Details", "Broker Name"])
@@ -926,6 +947,26 @@ def territory_from_any(lv_subject: str, lv_body_preview: str, lv_full_body_text:
 
     return ""
 
+def is_promotional_non_territory_email(
+    lv_subject: str,
+    lv_body_preview: str,
+    lv_full_body_text: str | None = None,
+) -> bool:
+    txt = " ".join([lv_subject or "", lv_body_preview or "", lv_full_body_text or ""]).lower()
+    promo_hits = 0
+    for needle in [
+        "sba financing",
+        "franchise growth",
+        "provide your franchisees access",
+        "why partner with us",
+        "startup-focused financing",
+        "low equity requirement",
+        "community advantage lender",
+    ]:
+        if needle in txt:
+            promo_hits += 1
+    return promo_hits >= 2
+
 def pretty_label_from_domain(lv_email_or_domain: str) -> str:
     lv_dom = (lv_email_or_domain or "").split("@")[-1].lower()
     if not lv_dom or "." not in lv_dom:
@@ -1349,6 +1390,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             if not lv_terr:
                 _ensure_full_text_once()
                 lv_terr = territory_from_any(lv_subj, lv_body_preview, lv_full_text)
+            if not lv_skipped_reason and not lv_terr:
+                if is_promotional_non_territory_email(lv_subj, lv_body_preview, lv_full_text):
+                    lv_skipped_reason = "Promo / No Territory"
 
             lv_recv    = lv_msg.get("receivedDateTime", "")
             lv_recv_dt = lv_recv[:10] if lv_recv else ""
@@ -1496,7 +1540,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     continue
                 ids = _internal_extract_action_ids(subj, body)
                 a_name = _internal_kv_value(body, "Buyer Name") or _internal_kv_value(body, "Name") or ""
-                a_loc = _internal_kv_value(body, "LOCATION") or _internal_kv_value(body, "Home City/State") or ""
+                a_loc = (
+                    _internal_kv_value(body, "LOCATION")
+                    or _internal_kv_value(body, "Home City/State")
+                    or _internal_kv_value(body, "City/State")
+                    or ""
+                )
                 a_state = _internal_state_from_city_state(a_loc or "")
                 a_brand = _internal_brand_from_subject(subj) or _safe_text(r.get("brand"))
                 for aid in ids:
