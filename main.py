@@ -1067,6 +1067,91 @@ def delete_week_slice_by_received_datetime(
     res = client.query(sql, job_config=job_config, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Deleted %s rows from %s for the given week slice.", res.num_dml_affected_rows, table_id)
 
+def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime) -> None:
+    """
+    Collapse current-week ACTION-only rows into existing canonical silver rows
+    across the whole table by brand + franchisee_id.
+
+    Behavior:
+    - if a current-week ACTION row matches an existing non-ACTION row, update the
+      existing row with closed_sale_date/state/name (only when target is blank)
+    - then delete the duplicate ACTION-only row from the current-week slice
+    - unmatched ACTION rows remain as-is
+    """
+    if not gv_BQ_PROJECT:
+        gv_LOG.info("BQ_PROJECT not set; skipping internal silver ACTION merge.")
+        return
+
+    table_id = f"{gv_BQ_PROJECT}.{gv_BQ_DATASET_SILVER}.{gv_BQ_TABLE_INTERNAL_SILVER}"
+    client = bq_client()
+    action_types = [
+        "TRANSFER COMPLETE",
+        "TRAINING APPROVED",
+        "TRAINING APPROVED/DEAL CLOSED",
+        "DEAL CLOSED",
+        "ADDITIONAL FRANCHISE PURCHASE COMPLETE",
+        "TERMINATION OF FRANCHISE AGREEMENT",
+        "MUTUAL TERMINATION",
+    ]
+    action_list_sql = ", ".join([f"'{x}'" for x in action_types])
+
+    update_sql = f"""
+        UPDATE `{table_id}` AS tgt
+        SET
+          closed_sale_date = COALESCE(tgt.closed_sale_date, src.closed_sale_date),
+          state_code = COALESCE(NULLIF(tgt.state_code, ''), src.state_code),
+          franchisee_name = COALESCE(NULLIF(tgt.franchisee_name, ''), src.franchisee_name)
+        FROM (
+          SELECT
+            brand,
+            franchisee_id,
+            ARRAY_AGG(franchisee_name IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
+            ARRAY_AGG(state_code IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
+            ARRAY_AGG(closed_sale_date IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
+          FROM `{table_id}`
+          WHERE received_datetime >= @start_dt
+            AND received_datetime <  @end_dt
+            AND COALESCE(TRIM(franchisee_id), '') != ''
+            AND UPPER(COALESCE(announcement_type, '')) IN ({action_list_sql})
+            AND balance_deposit_date IS NULL
+          GROUP BY brand, franchisee_id
+        ) AS src
+        WHERE tgt.brand = src.brand
+          AND tgt.franchisee_id = src.franchisee_id
+          AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
+          AND UPPER(COALESCE(tgt.announcement_type, '')) NOT IN ({action_list_sql})
+    """
+
+    delete_sql = f"""
+        DELETE FROM `{table_id}` AS src
+        WHERE src.received_datetime >= @start_dt
+          AND src.received_datetime <  @end_dt
+          AND COALESCE(TRIM(src.franchisee_id), '') != ''
+          AND UPPER(COALESCE(src.announcement_type, '')) IN ({action_list_sql})
+          AND src.balance_deposit_date IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM `{table_id}` AS tgt
+            WHERE tgt.brand = src.brand
+              AND tgt.franchisee_id = src.franchisee_id
+              AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
+              AND UPPER(COALESCE(tgt.announcement_type, '')) NOT IN ({action_list_sql})
+          )
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start_dt", "TIMESTAMP", start_dt),
+            bigquery.ScalarQueryParameter("end_dt", "TIMESTAMP", end_dt),
+        ]
+    )
+
+    gv_LOG.info("Merging current-week ACTION rows into existing silver rows for %s", table_id)
+    upd = client.query(update_sql, job_config=job_config, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("Internal silver ACTION merge updated %s rows.", upd.num_dml_affected_rows)
+    dele = client.query(delete_sql, job_config=job_config, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows.", dele.num_dml_affected_rows)
+
 # ============================ Path helper for GCS =============================
 def join_prefix(base_prefix: str, *parts: str) -> str:
     base = (base_prefix or "").strip().strip("/")
@@ -1390,9 +1475,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             if not lv_terr:
                 _ensure_full_text_once()
                 lv_terr = territory_from_any(lv_subj, lv_body_preview, lv_full_text)
-            if not lv_skipped_reason and not lv_terr:
-                if is_promotional_non_territory_email(lv_subj, lv_body_preview, lv_full_text):
-                    lv_skipped_reason = "Promo / No Territory"
+            if not lv_skipped_reason and is_promotional_non_territory_email(lv_subj, lv_body_preview, lv_full_text):
+                lv_terr = ""
+                lv_skipped_reason = "Promo / No Territory"
 
             lv_recv    = lv_msg.get("receivedDateTime", "")
             lv_recv_dt = lv_recv[:10] if lv_recv else ""
@@ -1766,6 +1851,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 exclude_manual=True,
             )
             load_jsonl_to_bigquery(internal_final_gcs_uri, gv_BQ_DATASET_SILVER, gv_BQ_TABLE_INTERNAL_SILVER)
+            merge_internal_action_rows_into_silver(lv_start_dt, lv_end_excl)
 
     if lv_df.empty:
         gv_LOG.info("No messages in the window; writing an empty workbook with all brand sheets.")
