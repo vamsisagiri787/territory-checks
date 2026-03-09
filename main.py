@@ -266,6 +266,7 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     amount_raw = (
         get_any(["Net Balance"])
         or get_any(["Amount to Draft Today"])
+        or get_any(["Territory Amendment Fee", "Amendment Fee"])
         or get_any(["ROFR Fee"])
         or get_any(["Remaining Balance"])
         or get_any(["Deposit Amount"])
@@ -330,6 +331,8 @@ def _internal_action_announcement_type(subject: str, body_text: str = "") -> Opt
     sl = s.lower()
     if "transfer complete" in sl:
         return "Transfer Complete"
+    if "transfer in progress" in sl:
+        return "Transfer In Progress"
     if re.search(r"training approved.*deal closed", sl):
         return "Training Approved/Deal Closed"
     if "deal closed" in sl:
@@ -357,6 +360,15 @@ def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
 
     _push(subject or "", subject_ids)
     _push((subject or "").split(" - ")[-1], subject_ids)
+
+    # Correction notes like:
+    # "The Franchise Number that is being Transferred is 35719, not 35179."
+    correction_match = re.search(
+        r"(?is)\bfranchise\s+number\b.*?\bis\s+(\d{3,}[A-Za-z0-9]*)",
+        body_text or "",
+    )
+    if correction_match:
+        return [correction_match.group(1)]
 
     # For transfer-style mails, prioritize seller franchise IDs only.
     for k in ["Seller FA#", "Seller FA", "FA#"]:
@@ -392,11 +404,27 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
         or _internal_kv_value(t, "Today's Date")
         or _internal_kv_value(t, "TRAINING APPROVED DATE")
         or _internal_kv_value(t, "Training Approved Date")
+        or _internal_kv_value(t, "DATE MUTUAL TERMINATION EFFECTIVE")
+        or _internal_kv_value(t, "Date Mutual Termination Effective")
+        or _internal_kv_value(t, "Mutual Termination Effective Date")
+        or _internal_kv_value(t, "Termination Effective Date")
+        or _internal_kv_value(t, "Transfer Closing Date")
         or _internal_kv_value(t, "Transfer Effective Date")
         or _internal_kv_value(t, "Effective Date")
         or _internal_kv_value(t, "Franchise Agreement-Effective Date")
         or _internal_kv_value(t, "Closed Sale Date")
     )
+    if not closed_raw:
+        m_term = re.search(
+            r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            t,
+        )
+        if m_term:
+            closed_raw = m_term.group(1)
+    if not closed_raw:
+        m_close = re.search(r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", t)
+        if m_close:
+            closed_raw = m_close.group(1)
     if not closed_raw:
         m = re.search(r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", t)
         if m:
@@ -404,11 +432,6 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
     parsed = _internal_parse_date_any(closed_raw or "")
     if parsed:
         return parsed
-    if pd.notna(received_datetime):
-        try:
-            return pd.to_datetime(received_datetime).date().isoformat()
-        except Exception:
-            return None
     return None
 
 def _internal_brand_from_subject(subject: str) -> Optional[str]:
@@ -1069,14 +1092,14 @@ def delete_week_slice_by_received_datetime(
 
 def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime) -> None:
     """
-    Collapse current-week ACTION-only rows into existing canonical silver rows
-    across the whole table by brand + franchisee_id.
+    Collapse ACTION-only rows into canonical silver rows across the whole table
+    by brand + franchisee_id.
 
     Behavior:
-    - if a current-week ACTION row matches an existing non-ACTION row, update the
-      existing row with closed_sale_date/state/name (only when target is blank)
-    - then delete the duplicate ACTION-only row from the current-week slice
-    - unmatched ACTION rows remain as-is
+    - update matching non-ACTION rows with latest ACTION closed_sale_date
+      (overwrite stale/missing closed_sale_date)
+    - backfill state_code/franchisee_name only when target is blank
+    - delete matched ACTION-only rows (keep unmatched ACTION rows)
     """
     if not gv_BQ_PROJECT:
         gv_LOG.info("BQ_PROJECT not set; skipping internal silver ACTION merge.")
@@ -1086,8 +1109,10 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
     client = bq_client()
     action_types = [
         "TRANSFER COMPLETE",
+        "TRANSFER IN PROGRESS",
         "TRAINING APPROVED",
         "TRAINING APPROVED/DEAL CLOSED",
+        "TRAINING APPROVED/CLOSED DEAL",
         "DEAL CLOSED",
         "ADDITIONAL FRANCHISE PURCHASE COMPLETE",
         "TERMINATION OF FRANCHISE AGREEMENT",
@@ -1098,58 +1123,52 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
     update_sql = f"""
         UPDATE `{table_id}` AS tgt
         SET
-          closed_sale_date = COALESCE(tgt.closed_sale_date, src.closed_sale_date),
+          closed_sale_date = COALESCE(src.closed_sale_date, tgt.closed_sale_date),
           state_code = COALESCE(NULLIF(tgt.state_code, ''), src.state_code),
           franchisee_name = COALESCE(NULLIF(tgt.franchisee_name, ''), src.franchisee_name)
         FROM (
           SELECT
             brand,
-            franchisee_id,
+            TRIM(franchisee_id) AS franchisee_id,
             ARRAY_AGG(franchisee_name IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
             ARRAY_AGG(state_code IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
             ARRAY_AGG(closed_sale_date IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
           FROM `{table_id}`
-          WHERE received_datetime >= @start_dt
-            AND received_datetime <  @end_dt
-            AND COALESCE(TRIM(franchisee_id), '') != ''
-            AND UPPER(COALESCE(announcement_type, '')) IN ({action_list_sql})
-            AND balance_deposit_date IS NULL
-          GROUP BY brand, franchisee_id
+          WHERE COALESCE(TRIM(franchisee_id), '') != ''
+            AND UPPER(TRIM(COALESCE(announcement_type, ''))) IN ({action_list_sql})
+            AND closed_sale_date IS NOT NULL
+          GROUP BY brand, TRIM(franchisee_id)
         ) AS src
         WHERE tgt.brand = src.brand
-          AND tgt.franchisee_id = src.franchisee_id
+          AND TRIM(tgt.franchisee_id) = src.franchisee_id
           AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
-          AND UPPER(COALESCE(tgt.announcement_type, '')) NOT IN ({action_list_sql})
+          AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
     """
 
     delete_sql = f"""
         DELETE FROM `{table_id}` AS src
-        WHERE src.received_datetime >= @start_dt
-          AND src.received_datetime <  @end_dt
-          AND COALESCE(TRIM(src.franchisee_id), '') != ''
-          AND UPPER(COALESCE(src.announcement_type, '')) IN ({action_list_sql})
+        WHERE COALESCE(TRIM(src.franchisee_id), '') != ''
+          AND UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({action_list_sql})
           AND src.balance_deposit_date IS NULL
           AND EXISTS (
             SELECT 1
             FROM `{table_id}` AS tgt
             WHERE tgt.brand = src.brand
-              AND tgt.franchisee_id = src.franchisee_id
+              AND TRIM(tgt.franchisee_id) = TRIM(src.franchisee_id)
               AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
-              AND UPPER(COALESCE(tgt.announcement_type, '')) NOT IN ({action_list_sql})
+              AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
           )
     """
 
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("start_dt", "TIMESTAMP", start_dt),
-            bigquery.ScalarQueryParameter("end_dt", "TIMESTAMP", end_dt),
-        ]
+    gv_LOG.info(
+        "Merging ACTION rows into existing silver rows for %s (run window %s to %s)",
+        table_id,
+        start_dt,
+        end_dt,
     )
-
-    gv_LOG.info("Merging current-week ACTION rows into existing silver rows for %s", table_id)
-    upd = client.query(update_sql, job_config=job_config, location=gv_BQ_LOCATION).result()
+    upd = client.query(update_sql, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Internal silver ACTION merge updated %s rows.", upd.num_dml_affected_rows)
-    dele = client.query(delete_sql, job_config=job_config, location=gv_BQ_LOCATION).result()
+    dele = client.query(delete_sql, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows.", dele.num_dml_affected_rows)
 
 # ============================ Path helper for GCS =============================
@@ -1621,9 +1640,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     # Keep regular ROFR template rows; skip ACTION-ROFR mapping.
                     continue
                 a_date = _internal_extract_action_date(body, r.get("received_datetime"))
-                if not a_date:
-                    continue
                 ids = _internal_extract_action_ids(subj, body)
+                if not ids:
+                    continue
                 a_name = _internal_kv_value(body, "Buyer Name") or _internal_kv_value(body, "Name") or ""
                 a_loc = (
                     _internal_kv_value(body, "LOCATION")
@@ -1737,7 +1756,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         row["announcement_type"] = ar_t
                     if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
                         row["state_code"] = ar.get("state_code")
-                    if _blank(row.get("closed_sale_date")) and not _blank(ar.get("closed_sale_date")):
+                    # For mapped ACTION rows, always carry latest closed date when present.
+                    if not _blank(ar.get("closed_sale_date")):
                         row["closed_sale_date"] = ar.get("closed_sale_date")
                     return row
 
