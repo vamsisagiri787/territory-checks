@@ -72,11 +72,16 @@ gv_SHOW_SUBJECT_IN_DETAILS = True
 # ======================= Internal Announcements (Skip from Counts) =======================
 # Emails that should be excluded from brand-wise territory counts but still appear in Audit.
 # Override/extend via ENV: INTERNAL_ANNOUNCEMENT_SENDERS (comma-separated).
-# Example: INTERNAL_ANNOUNCEMENT_SENDERS="rgalloway@strategicfranchising.com,another@strategicfranchising.com"
+# Example: INTERNAL_ANNOUNCEMENT_SENDERS="rgalloway@strategicfranchising.com,jsiehl@franchisesupport.net,another@strategicfranchising.com"
 
 gv_INTERNAL_ANNOUNCEMENT_SENDERS = {
     s.strip().lower()
-    for s in (os.getenv("INTERNAL_ANNOUNCEMENT_SENDERS", "rgalloway@strategicfranchising.com").split(","))
+    for s in (
+        os.getenv(
+            "INTERNAL_ANNOUNCEMENT_SENDERS",
+            "rgalloway@strategicfranchising.com,jsiehl@franchisesupport.net",
+        ).split(",")
+    )
     if s.strip()
 }
 
@@ -96,10 +101,16 @@ def is_internal_announcement(sender_email: str, sender_name: str, subject: str, 
     if se and se in gv_INTERNAL_ANNOUNCEMENT_SENDERS:
         return True
 
-    # Extra safety: if sender looks like Rebecca (name/alias) treat as internal
-    if "rebecca" in sn or "rgalloway" in se:
+    # Extra safety: if sender looks like Rebecca/Jeff (name/alias) treat as internal
+    if "rebecca" in sn or "rgalloway" in se or "jeff siehl" in sn or "jsiehl" in se:
         # Only apply this name-based shortcut for internal domains
-        if se.endswith("@strategicfranchising.com") or se.endswith("@sfs") or "strategicfranchising" in se:
+        if (
+            se.endswith("@strategicfranchising.com")
+            or se.endswith("@franchisesupport.net")
+            or se.endswith("@sfs")
+            or "strategicfranchising" in se
+            or "franchisesupport" in se
+        ):
             return True
 
     hay = f"{subject or ''} {body_preview or ''}".lower()
@@ -128,6 +139,15 @@ INTERNAL_EXCEL_FINAL_COLS = [
     "closed_sale_date",
     "amount_usd",
 ]
+
+# Downstream reporting rule:
+# only these announcement types are treated as completed balance sales in the
+# summary/BvB pipeline. Other types can still carry dates for operational
+# tracking, but they should not count toward closed organic/broker balances.
+gv_INTERNAL_BALANCE_REPORT_TYPES = {
+    "BALANCE",
+    "DEPOSIT + BALANCE",
+}
 
 def _internal_money_to_decimal(s: str) -> Optional[str]:
     if not s:
@@ -194,6 +214,73 @@ def _internal_kv_value(text: str, key: str) -> Optional[str]:
         return v if v and v.lower() not in {"n/a", "na", "-"} else None
     return None
 
+def _internal_kv_values(text: str, key: str) -> List[str]:
+    if not text or not key:
+        return []
+    t = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", t)
+    key_words = [w for w in re.split(r"\s+", key.strip()) if w]
+    if not key_words:
+        return []
+    k = r"\s+".join(re.escape(w) for w in key_words)
+    vals: List[str] = []
+    for pat in (
+        rf"(?im)^\s*{k}\s*:?\s*$\s*^\s*(.+?)\s*$",
+        rf"(?im)^\s*{k}\s*:?\s*(.+?)\s*$",
+    ):
+        for m in re.finditer(pat, t):
+            v = (m.group(1) or "").strip()
+            if v and v.lower() not in {"n/a", "na", "-"} and v not in vals:
+                vals.append(v)
+        if vals:
+            break
+    return vals
+
+def _internal_html_cell_text(html_fragment: str) -> str:
+    if not html_fragment:
+        return ""
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", html_fragment)
+    txt = re.sub(r"(?is)</p\s*>", "\n", txt)
+    txt = re.sub(r"(?is)</div\s*>", "\n", txt)
+    txt = re.sub(r"(?is)<.*?>", " ", txt)
+    txt = html.unescape(txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+def _internal_norm_key(key: str) -> str:
+    k = html.unescape(str(key or ""))
+    k = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", k)
+    k = re.sub(r"[^A-Za-z0-9/ ]+", " ", k)
+    k = re.sub(r"\s+", " ", k).strip(" :").lower()
+    return k
+
+def _internal_html_table_map(body_html: str) -> Dict[str, List[str]]:
+    """
+    Parse Outlook-style 2-column announcement tables directly from HTML.
+    Jeff's newer mails still render as a visible table in Outlook, but the
+    plain-text flattening can lose the key/value row boundaries.
+    """
+    if not body_html:
+        return {}
+    src = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", body_html)
+    out: Dict[str, List[str]] = {}
+    for row_html in re.findall(r"(?is)<tr\b.*?>(.*?)</tr>", src):
+        cells = re.findall(r"(?is)<t[dh]\b.*?>(.*?)</t[dh]>", row_html)
+        if len(cells) < 2:
+            continue
+        key = _internal_norm_key(_internal_html_cell_text(cells[0]))
+        if not key:
+            continue
+        value = " ".join(
+            part for part in (_internal_html_cell_text(c) for c in cells[1:]) if part
+        ).strip()
+        if not value or value.lower() in {"n/a", "na", "-"}:
+            continue
+        bucket = out.setdefault(key, [])
+        if value not in bucket:
+            bucket.append(value)
+    return out
+
 def _internal_looks_like_template(text: str) -> bool:
     t = (text or "").lower()
     must = 0
@@ -224,11 +311,17 @@ def _internal_latest_payload_text(text: str) -> str:
             return s
     return t
 
-def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
+def _internal_parse_fields(preview_text: str, full_text: str, body_html: str = "") -> Dict[str, Any]:
     full_t = _internal_latest_payload_text(full_text or "")
     prev_t = (preview_text or "")
+    html_map = _internal_html_table_map(body_html or "")
+    subject_text = f"{full_t} {prev_t}"
 
     def get_any(keys: List[str]) -> Optional[str]:
+        for k in keys:
+            vals = html_map.get(_internal_norm_key(k), [])
+            if vals:
+                return vals[0]
         for k in keys:
             v = _internal_kv_value(full_t, k)
             if v:
@@ -250,7 +343,15 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
         if m_corr:
             correction_name = (m_corr.group(1) or "").strip(" .;:-")
 
+    transfer_fee_subject = "transfer fee paid" in subject_text.lower()
+    name_values = (
+        html_map.get(_internal_norm_key("Name"), [])
+        or _internal_kv_values(full_t, "Name")
+        or _internal_kv_values(prev_t, "Name")
+    )
     name = correction_name or get_any(["Name", "Buyer Name", "Contact Name"])
+    if transfer_fee_subject and name_values:
+        name = " | ".join(name_values)
     released = get_any(["Released Date", "Signing Date"])
     fsc = get_any(["FSC", "Director of Franchising", "Dir of Franchising"])
     home_city_state = get_any(["Home City/State", "Home City / State", "City/State", "City / State"])
@@ -293,9 +394,20 @@ def _internal_parse_fields(preview_text: str, full_text: str) -> Dict[str, Any]:
     }
 
 def _internal_announcement_type(subject: str, body_preview: str = "", body_text: str = "") -> str:
+    # Template subject classifier.
+    # Rule: preserve the original template subject type for balance/deposit style mails.
+    # ACTION mails are only allowed to backfill dates/state unless there is no template row.
     s = (subject or "").lower()
     if "rofr" in s:
         return "ROFR"
+    if "transfer fee paid" in s:
+        return "Transfer Fee Paid"
+    if "territory amendment" in s:
+        return "Territory Amendment"
+    if "renewal complete" in s:
+        return "Renewal Complete"
+    if "expiration of franchise agreement" in s:
+        return "Expiration of Franchise Agreement"
     has_deposit = "deposit" in s
     has_partial = "partial balance" in s
     has_balance = "balance" in s
@@ -321,6 +433,8 @@ def _internal_announcement_type(subject: str, body_preview: str = "", body_text:
     return "OTHER"
 
 def _internal_action_announcement_type(subject: str, body_text: str = "") -> Optional[str]:
+    # ACTION subject/body classifier.
+    # Rule: this is used for closed-sale/effective-date backfill and for action-only inserts.
     s = (subject or "").strip()
     if not s:
         return None
@@ -339,9 +453,29 @@ def _internal_action_announcement_type(subject: str, body_text: str = "") -> Opt
         return "Deal Closed"
     if "additional franchise purchase complete" in sl:
         return "Additional Franchise Purchase Complete"
+    if "renewal complete" in sl:
+        return "Renewal Complete"
+    if "expiration of franchise agreement" in sl:
+        return "Expiration of Franchise Agreement"
     if "action" in sl:
         return s
     return None
+
+def _is_internal_action_type(v: Any) -> bool:
+    s = str(v or "").strip().upper()
+    if not s:
+        return False
+    return s in {
+        "TRANSFER COMPLETE",
+        "TRANSFER IN PROGRESS",
+        "TRAINING APPROVED",
+        "TRAINING APPROVED/DEAL CLOSED",
+        "TRAINING APPROVED/CLOSED DEAL",
+        "DEAL CLOSED",
+        "ADDITIONAL FRANCHISE PURCHASE COMPLETE",
+        "TERMINATION OF FRANCHISE AGREEMENT",
+        "MUTUAL TERMINATION",
+    }
 
 def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
     subject_ids: List[str] = []
@@ -396,6 +530,8 @@ def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
     return subject_ids
 
 def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Optional[str]:
+    # ACTION effective-date extractor.
+    # Rule: prefer explicit business-effective dates from action templates before any fallback.
     t = str(body_text or "")
     t = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", t)
 
@@ -404,6 +540,11 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
         or _internal_kv_value(t, "Today's Date")
         or _internal_kv_value(t, "TRAINING APPROVED DATE")
         or _internal_kv_value(t, "Training Approved Date")
+        or _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE")
+        or _internal_kv_value(t, "Date Renewal Effective Date")
+        or _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE")
+        or _internal_kv_value(t, "Date Franchise Expiration Effective")
+        or _internal_kv_value(t, "Franchise Expiration Effective Date")
         or _internal_kv_value(t, "DATE MUTUAL TERMINATION EFFECTIVE")
         or _internal_kv_value(t, "Date Mutual Termination Effective")
         or _internal_kv_value(t, "Mutual Termination Effective Date")
@@ -774,13 +915,22 @@ def _norm_name(lv_name: str) -> str:
 def _html_to_text(lv_html_str: str) -> str:
     if not lv_html_str:
         return ""
+    # Preserve basic block/table structure before stripping tags.
+    # Internal announcement emails often arrive as HTML tables, and flattening all
+    # <tr>/<td> tags into spaces causes keys like "Released Date" and values like
+    # "3/13/2026" to collapse into an unparseable line.
     lv_txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", lv_html_str)
+    lv_txt = re.sub(r"(?is)</tr\s*>", "\n", lv_txt)
+    lv_txt = re.sub(r"(?is)</t[dh]\s*>", "\t", lv_txt)
+    lv_txt = re.sub(r"(?is)</div\s*>", "\n", lv_txt)
+    lv_txt = re.sub(r"(?is)</li\s*>", "\n", lv_txt)
     lv_txt = re.sub(r"(?is)<br\s*/?>", "\n", lv_txt)
     lv_txt = re.sub(r"(?is)</p\s*>", "\n", lv_txt)
     lv_txt = re.sub(r"(?is)<.*?>", " ", lv_txt)
     lv_txt = html.unescape(lv_txt)
     lv_txt = re.sub(r"\r", "\n", lv_txt)
     lv_txt = re.sub(r"[ \t]+", " ", lv_txt)
+    lv_txt = re.sub(r" *\n *", "\n", lv_txt)
     lv_txt = re.sub(r"\n{3,}", "\n\n", lv_txt)
     return lv_txt.strip()
 
@@ -1115,6 +1265,8 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
         "TRAINING APPROVED/CLOSED DEAL",
         "DEAL CLOSED",
         "ADDITIONAL FRANCHISE PURCHASE COMPLETE",
+        "RENEWAL COMPLETE",
+        "EXPIRATION OF FRANCHISE AGREEMENT",
         "TERMINATION OF FRANCHISE AGREEMENT",
         "MUTUAL TERMINATION",
     ]
@@ -1140,8 +1292,11 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
           GROUP BY brand, TRIM(franchisee_id)
         ) AS src
         WHERE tgt.brand = src.brand
-          AND TRIM(tgt.franchisee_id) = src.franchisee_id
           AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
+          AND (
+            TRIM(tgt.franchisee_id) = src.franchisee_id
+            OR REGEXP_CONTAINS(TRIM(tgt.franchisee_id), CONCAT(r'(^|[^0-9])', src.franchisee_id, r'([^0-9]|$)'))
+          )
           AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
     """
 
@@ -1154,8 +1309,11 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
             SELECT 1
             FROM `{table_id}` AS tgt
             WHERE tgt.brand = src.brand
-              AND TRIM(tgt.franchisee_id) = TRIM(src.franchisee_id)
               AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
+              AND (
+                TRIM(tgt.franchisee_id) = TRIM(src.franchisee_id)
+                OR REGEXP_CONTAINS(TRIM(tgt.franchisee_id), CONCAT(r'(^|[^0-9])', TRIM(src.franchisee_id), r'([^0-9]|$)'))
+              )
               AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
           )
     """
@@ -1415,35 +1573,64 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             if not lv_skipped_reason and is_internal_announcement(lv_sender, lv_sender_name, lv_subj, lv_body_preview):
                 lv_skipped_reason = "Internal Announcement"
                 _ensure_full_text_once()
-                internal_fields = _internal_parse_fields(lv_body_preview, lv_full_text or "")
+                internal_fields = _internal_parse_fields(lv_body_preview, lv_full_text or "", lv_full_html or "")
                 raw_id = _internal_stable_raw_id(lv_msg, lv_full_text or "")
                 embedded_subj = _internal_embedded_subject(lv_full_text or "")
                 effective_subj = embedded_subj or lv_subj
-                lv_internal_candidates.append({
-                    "raw_id": raw_id,
-                    "source_system": "outlook",
-                    "mailbox": gv_MASTER_MAILBOX,
-                    "ingested_at": lv_run_ts,
-                    "pipeline_run_id": None,
-                    "parser_version": gv_INTERNAL_PARSER_VERSION,
-                    "received_datetime": lv_msg.get("receivedDateTime", ""),
-                    "sender_email": lv_sender,
-                    "subject": lv_subj,
-                    "web_link": lv_msg.get("webLink", ""),
-                    "body_content_type": "html" if lv_full_html else "text",
-                    "body_html": lv_full_html or "",
-                    "body_text": lv_full_text or "",
-                    "body_preview": lv_body_preview,
-                    "to_emails": _emails_to_list(lv_msg.get("toRecipients")),
-                    "cc_emails": _emails_to_list(lv_msg.get("ccRecipients")),
-                    "has_attachments": lv_msg.get("hasAttachments", False),
-                    "skipped_reason": "",
-                    "extracted_fields_json": json.dumps(internal_fields, ensure_ascii=False),
-                    "brand": _internal_brand_from_subject(effective_subj),
-                    "franchisee_id": _internal_franchisee_id_from_subject(effective_subj),
-                    "announcement_type": _internal_announcement_type(effective_subj, lv_body_preview, lv_full_text or ""),
-                    **internal_fields,
-                })
+                subject_brand = _internal_brand_from_subject(effective_subj)
+                if not _safe_text(internal_fields.get("brand")):
+                    internal_fields["brand"] = subject_brand
+                template_type = _internal_announcement_type(effective_subj, lv_body_preview, lv_full_text or "")
+                # Multi-ID template expansion.
+                # Rule: template mails like Transfer Fee Paid can describe several seller
+                # franchise IDs in one email. We materialize one clean template row per ID
+                # first, so later ACTION backfill updates those rows instead of inserting
+                # ACTION-only rows with the wrong type.
+                candidate_ids = _internal_extract_action_ids(effective_subj, lv_full_text or lv_body_preview or "")
+                if not candidate_ids:
+                    # Old behavior kept only the first subject ID:
+                    # single_id = _internal_franchisee_id_from_subject(effective_subj)
+                    # candidate_ids = [single_id] if single_id else [""]
+                    #
+                    # We still retain that fallback, but only when no multi-ID payload was found.
+                    single_id = _internal_franchisee_id_from_subject(effective_subj)
+                    candidate_ids = [single_id] if single_id else [""]
+                if template_type == "Transfer Fee Paid" and len(candidate_ids) > 1:
+                    # Transfer Fee Paid carries one financial amount across multiple seller
+                    # franchise IDs. Keep that as one financial row instead of tripling the
+                    # amount into one row per ID.
+                    candidate_ids = [", ".join(dict.fromkeys([str(x).strip() for x in candidate_ids if str(x).strip()]))]
+                seen_candidate_ids: set[str] = set()
+                for candidate_id in candidate_ids:
+                    cid = str(candidate_id or "").strip()
+                    if cid in seen_candidate_ids:
+                        continue
+                    seen_candidate_ids.add(cid)
+                    lv_internal_candidates.append({
+                        "raw_id": raw_id,
+                        "source_system": "outlook",
+                        "mailbox": gv_MASTER_MAILBOX,
+                        "ingested_at": lv_run_ts,
+                        "pipeline_run_id": None,
+                        "parser_version": gv_INTERNAL_PARSER_VERSION,
+                        "received_datetime": lv_msg.get("receivedDateTime", ""),
+                        "sender_email": lv_sender,
+                        "subject": lv_subj,
+                        "web_link": lv_msg.get("webLink", ""),
+                        "body_content_type": "html" if lv_full_html else "text",
+                        "body_html": lv_full_html or "",
+                        "body_text": lv_full_text or "",
+                        "body_preview": lv_body_preview,
+                        "to_emails": _emails_to_list(lv_msg.get("toRecipients")),
+                        "cc_emails": _emails_to_list(lv_msg.get("ccRecipients")),
+                        "has_attachments": lv_msg.get("hasAttachments", False),
+                        "skipped_reason": "",
+                        "extracted_fields_json": json.dumps(internal_fields, ensure_ascii=False),
+                        "brand": subject_brand,
+                        "franchisee_id": cid,
+                        "announcement_type": template_type,
+                        **internal_fields,
+                    })
 
             lv_broker_subj = broker_from_subject(lv_subj)
             lv_broker_fw   = None if lv_broker_subj else forwarded_broker_from_text(lv_body_preview)
@@ -1597,6 +1784,16 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             if action_type and "rofr" in action_type.lower():
                 # Keep in RAW/AUDIT, skip from FINAL/Silver action flow.
                 return "ROFR_ACTION_SKIP"
+            # Keep renewal/expiration actions in silver.
+            # Downstream users want these operational rows visible in the final
+            # balances/deposits tracking output even though they are not financial.
+            #
+            # Old behavior (kept here for backtracking) skipped them:
+            # if action_type and action_type.strip().lower() in {
+            #     "renewal complete",
+            #     "expiration of franchise agreement",
+            # }:
+            #     return "NON_FINANCIAL_ACTION_SKIP"
             if _is_re_fw_subject(subj):
                 # Allow RE/FW when it carries quoted original template/action content.
                 if has_embedded_payload:
@@ -1624,6 +1821,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             df_internal_raw.loc[mask_clean, "skipped_reason"] = "SUPERSEDED_BY_RE"
 
         # ACTION mapping for closed_sale_date (ROFR ACTION is intentionally skipped).
+        # Rule: action rows can backfill effective dates/state and can insert action-only rows
+        # when no template row exists, but they must not overwrite template announcement types.
         action_by_id: Dict[str, dict] = {}
         action_rows: List[dict] = []
         if not df_internal_raw_full.empty:
@@ -1639,6 +1838,10 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 if "rofr" in a_type.lower():
                     # Keep regular ROFR template rows; skip ACTION-ROFR mapping.
                     continue
+                # Keep renewal/expiration actions in silver for downstream reporting.
+                # Old behavior skipped them entirely:
+                # if a_type.strip().lower() in {"renewal complete", "expiration of franchise agreement"}:
+                #     continue
                 a_date = _internal_extract_action_date(body, r.get("received_datetime"))
                 ids = _internal_extract_action_ids(subj, body)
                 if not ids:
@@ -1704,22 +1907,55 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 .reset_index(drop=True)
             )
 
-            # Prefer concrete type over OTHER when grouped rows conflict.
+            # Prefer the latest non-action/template type over OTHER or later ACTION types.
+            # Rule: original financial/template mail owns announcement_type; ACTION mail only
+            # backfills dates/state unless no template type exists for that merge key.
             if "announcement_type" in df_internal_final.columns:
                 tmp = df_internal_pre.copy()
                 tmp["_atype"] = tmp["announcement_type"].fillna("").astype(str).str.strip()
                 tmp = tmp[tmp["_atype"] != ""]
                 tmp = tmp[tmp["_atype"].str.upper() != "OTHER"]
-                non_other_map = (
+
+                # Old behavior:
+                # non_other_map = (
+                #     tmp.sort_values(by=["_merge_key", "received_datetime"])
+                #     .groupby("_merge_key", dropna=False)["_atype"]
+                #     .last()
+                #     .to_dict()
+                # )
+                #
+                # That allowed later ACTION rows to replace template announcement_type.
+                # We now prefer latest non-action/template type first.
+                tmp_non_action = tmp[~tmp["_atype"].apply(_is_internal_action_type)]
+                preferred_type_map = (
+                    tmp_non_action.sort_values(by=["_merge_key", "received_datetime"])
+                    .groupby("_merge_key", dropna=False)["_atype"]
+                    .last()
+                    .to_dict()
+                )
+                fallback_type_map = (
                     tmp.sort_values(by=["_merge_key", "received_datetime"])
                     .groupby("_merge_key", dropna=False)["_atype"]
                     .last()
                     .to_dict()
                 )
-                mask_other = df_internal_final["announcement_type"].fillna("").astype(str).str.strip().str.upper().isin(["", "OTHER"])
-                df_internal_final.loc[mask_other, "announcement_type"] = df_internal_final.loc[mask_other, "_merge_key"].map(non_other_map).fillna(df_internal_final.loc[mask_other, "announcement_type"])
+                preferred_series = (
+                    df_internal_final["_merge_key"].map(preferred_type_map)
+                    .fillna(df_internal_final["_merge_key"].map(fallback_type_map))
+                )
+                mask_replace = (
+                    preferred_series.notna()
+                    & (
+                        df_internal_final["announcement_type"].fillna("").astype(str).str.strip().eq("")
+                        | df_internal_final["announcement_type"].fillna("").astype(str).str.strip().str.upper().eq("OTHER")
+                        | df_internal_final["announcement_type"].apply(_is_internal_action_type)
+                    )
+                )
+                df_internal_final.loc[mask_replace, "announcement_type"] = preferred_series[mask_replace]
 
             # Apply ACTION closed-sale/date mapping by franchisee_id only.
+            # Rule: preserve template announcement_type such as DEPOSIT + BALANCE and
+            # Transfer Fee Paid; use ACTION mail only for effective/closed dates and blanks.
             if action_by_id:
                 def _norm_id(v: Any) -> str:
                     if v is None:
@@ -1744,18 +1980,33 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     return str(v).strip() == ""
 
                 def _apply_action(row: pd.Series) -> pd.Series:
-                    rid = _norm_id(row.get("franchisee_id"))
-                    if not rid:
+                    raw_ids = str(row.get("franchisee_id") or "").strip()
+                    rid = _norm_id(raw_ids)
+                    if not rid and not raw_ids:
                         return row
                     ar = action_by_id.get(rid)
+                    if not ar and raw_ids:
+                        multi_ids = []
+                        for m in re.findall(r"\b(\d{3,})\b", raw_ids):
+                            mid = _norm_id(m)
+                            if mid and mid not in multi_ids:
+                                multi_ids.append(mid)
+                        for mid in multi_ids:
+                            if mid in action_by_id:
+                                ar = action_by_id[mid]
+                                break
                     if not ar:
                         return row
-                    at = str(row.get("announcement_type") or "").strip().upper()
-                    ar_t = str(ar.get("announcement_type") or "").strip()
-                    if at in {"", "OTHER"} and ar_t:
-                        row["announcement_type"] = ar_t
                     if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
                         row["state_code"] = ar.get("state_code")
+                    # Old behavior kept action type in sync with ACTION mail when template type
+                    # was blank/OTHER. We intentionally do not apply it now because template
+                    # subjects like DEPOSIT + BALANCE and Transfer Fee Paid must be preserved.
+                    #
+                    # at = str(row.get("announcement_type") or "").strip().upper()
+                    # ar_t = str(ar.get("announcement_type") or "").strip()
+                    # if at in {"", "OTHER"} and ar_t:
+                    #     row["announcement_type"] = ar_t
                     # For mapped ACTION rows, always carry latest closed date when present.
                     if not _blank(ar.get("closed_sale_date")):
                         row["closed_sale_date"] = ar.get("closed_sale_date")
@@ -1768,12 +2019,17 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 df_internal_final.get("franchisee_id", pd.Series([], dtype=str))
                 .astype(str).str.strip().replace("nan", "").tolist()
             )
+            covered_ids = set(existing_ids)
+            for existing in list(existing_ids):
+                for m in re.findall(r"\b(\d{3,})\b", existing):
+                    covered_ids.add(str(m).strip())
             inserts: List[dict] = []
             for ar in action_rows:
                 aid = str(ar.get("franchisee_id") or "").strip()
-                if not aid or aid in existing_ids:
+                if not aid or aid in existing_ids or aid in covered_ids:
                     continue
                 existing_ids.add(aid)
+                covered_ids.add(aid)
                 new_row = {c: pd.NA for c in df_internal_final.columns}
                 for c in ["brand", "franchisee_id", "franchisee_name", "announcement_type", "state_code", "closed_sale_date", "received_datetime", "ingested_at", "raw_id"]:
                     if c in new_row:
