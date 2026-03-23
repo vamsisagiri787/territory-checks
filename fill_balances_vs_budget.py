@@ -33,9 +33,13 @@ GCS_TEMPLATE_BLOB = os.getenv(
     "GCS_TEMPLATE_BLOB",
     "sfs_strategic_franchising/Balances_VS_Budget/templates/2026_Balances_vs_Budget_template.xlsx",
 )
+# ===================== SFS_009 =====================
+# Reason: Keep workbook uploads under the same weekly/year/month folder pattern
+# used by territory checks so bucket navigation stays consistent across reports.
+# ====================================================
 GCS_OUTPUT_PREFIX = os.getenv(
     "GCS_OUTPUT_PREFIX",
-    "sfs_strategic_franchising/Balances_VS_Budget/outputs",
+    "sfs_strategic_franchising/Balances_VS_Budget/outputs/weekly",
 )
 
 LOGO_DIR = os.getenv(

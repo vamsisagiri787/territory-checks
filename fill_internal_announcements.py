@@ -21,9 +21,13 @@ GCS_TEMPLATE_BLOB = os.getenv(
     "GCS_TEMPLATE_BLOB",
     "sfs_strategic_franchising/Balances and Deposits/templates/Gold_Template_Internal_Announcements.xlsx"
 )
+# ===================== SFS_009 =====================
+# Reason: Keep workbook uploads under the same weekly/year/month folder pattern
+# used by territory checks so bucket navigation stays consistent across reports.
+# ====================================================
 GCS_OUTPUT_PREFIX = os.getenv(
     "GCS_OUTPUT_PREFIX",
-    "sfs_strategic_franchising/Balances and Deposits/outputs"
+    "sfs_strategic_franchising/Balances and Deposits/outputs/weekly"
 )
 
 BRAND_SHEET = {
@@ -167,8 +171,13 @@ def main():
         df["announcement_type"] = df["announcement_type"].fillna("").astype(str).str.strip()
         df["received_datetime"] = pd.to_datetime(df["received_datetime"], errors="coerce")
 
-        # If silver still has standalone ACTION rows for an already existing franchise row,
-        # suppress those ACTION rows in gold output (canonical row should win).
+        # ===================== SFS_004 =====================
+        # Reason: silver can still contain closed-date-only residue rows from
+        # ACTION emails after the canonical financial row already exists. Some
+        # of those residual rows now carry announcement_type=OTHER after merge,
+        # so suppress them in the workbook layer using the business shape of the
+        # row rather than announcement_type alone.
+        # ==================================================
         has_core = (
             df["balance_deposit_date"].notna()
             | df["amount_usd"].notna()
@@ -180,8 +189,14 @@ def main():
         core_names = set(key_name[(df["franchisee_id"] == "") & (df["franchisee_name"] != "") & has_core].tolist())
 
         is_action_only = df["announcement_type"].apply(_is_action_type) & df["balance_deposit_date"].isna() & df["amount_usd"].isna()
+        is_residual_other = (
+            df["announcement_type"].fillna("").astype(str).str.strip().str.upper().eq("OTHER")
+            & df["balance_deposit_date"].isna()
+            & df["amount_usd"].isna()
+            & df["closed_sale_date"].notna()
+        )
         drop_mask = (
-            is_action_only
+            (is_action_only | is_residual_other)
             & (
                 ((df["franchisee_id"] != "") & key_id.isin(core_ids))
                 | ((df["franchisee_id"] == "") & (df["franchisee_name"] != "") & key_name.isin(core_names))

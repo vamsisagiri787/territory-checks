@@ -1,0 +1,97 @@
+main:
+  steps:
+    - init:
+        assign:
+          - project_id: "sfs-data-lake"
+          - region: "us-central1"
+          - ingestion_job: "sfs-territory-checks-job"
+          - internal_job: "sfs-internal-announcements-job"
+          - budget_job: "sfs-balances-vs-budget-job"
+
+    - run_ingestion:
+        try:
+          call: googleapis.run.v2.projects.locations.jobs.run
+          args:
+            name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + ingestion_job}
+            body: {}
+          result: ingestion_exec
+        except:
+          as: e
+          steps:
+            - log_ingestion_failure:
+                call: sys.log
+                args:
+                  data:
+                    event: "SFS_WEEKLY_REPORTING_FAILED"
+                    workflow: "sfs-weekly-reporting-workflow"
+                    failed_step: "run_ingestion"
+                    job: "sfs-territory-checks-job"
+                  severity: "ERROR"
+            - raise_ingestion_failure:
+                raise:
+                  event: "SFS_WEEKLY_REPORTING_FAILED"
+                  workflow: "sfs-weekly-reporting-workflow"
+                  failed_step: "run_ingestion"
+                  job: "sfs-territory-checks-job"
+                  message: "Ingestion job failed. Check Cloud Run job logs and workflow custom log entry."
+
+    - run_internal_announcements:
+        try:
+          call: googleapis.run.v2.projects.locations.jobs.run
+          args:
+            name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + internal_job}
+            body: {}
+          result: internal_exec
+        except:
+          as: e
+          steps:
+            - log_internal_failure:
+                call: sys.log
+                args:
+                  data:
+                    event: "SFS_WEEKLY_REPORTING_FAILED"
+                    workflow: "sfs-weekly-reporting-workflow"
+                    failed_step: "run_internal_announcements"
+                    job: "sfs-internal-announcements-job"
+                  severity: "ERROR"
+            - raise_internal_failure:
+                raise:
+                  event: "SFS_WEEKLY_REPORTING_FAILED"
+                  workflow: "sfs-weekly-reporting-workflow"
+                  failed_step: "run_internal_announcements"
+                  job: "sfs-internal-announcements-job"
+                  message: "Internal announcements job failed. Check Cloud Run job logs and workflow custom log entry."
+
+    - run_balances_vs_budget:
+        try:
+          call: googleapis.run.v2.projects.locations.jobs.run
+          args:
+            name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + budget_job}
+            body: {}
+          result: budget_exec
+        except:
+          as: e
+          steps:
+            - log_budget_failure:
+                call: sys.log
+                args:
+                  data:
+                    event: "SFS_WEEKLY_REPORTING_FAILED"
+                    workflow: "sfs-weekly-reporting-workflow"
+                    failed_step: "run_balances_vs_budget"
+                    job: "sfs-balances-vs-budget-job"
+                  severity: "ERROR"
+            - raise_budget_failure:
+                raise:
+                  event: "SFS_WEEKLY_REPORTING_FAILED"
+                  workflow: "sfs-weekly-reporting-workflow"
+                  failed_step: "run_balances_vs_budget"
+                  job: "sfs-balances-vs-budget-job"
+                  message: "Balances vs budget job failed. Check Cloud Run job logs and workflow custom log entry."
+
+    - done:
+        return:
+          status: "success"
+          ingestion_execution: ${ingestion_exec}
+          internal_execution: ${internal_exec}
+          budget_execution: ${budget_exec}

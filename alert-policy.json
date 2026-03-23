@@ -1,0 +1,26 @@
+{
+  "displayName": "SFS Weekly Reporting Workflow Failure",
+  "documentation": {
+    "content": "The SFS weekly reporting workflow failed. Check Workflows execution history and Cloud Run job logs.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "SFS workflow failure log match",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"workflows.googleapis.com/Workflow\" severity>=ERROR jsonPayload.event=\"SFS_WEEKLY_REPORTING_FAILED\""
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    },
+    "autoClose": "86400s"
+  },
+  "notificationChannels": [
+    "projects/sfs-data-lake/notificationChannels/10839455724856130996"
+  ],
+  "enabled": true
+}

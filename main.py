@@ -1,4 +1,13 @@
 from __future__ import annotations
+# ==================== SFS_001 ====================
+# Responsibility boundary for this program:
+# - This file is ingestion/orchestration for territory + internal
+#   announcement bronze/silver loads only.
+# - Downstream report generation must stay outside this file
+#   (fill_internal_announcements.py / fill_balances_vs_budget.py).
+# - Those downstream scripts should be orchestrated by Scheduler +
+#   Workflow / separate jobs, not embedded into main.py.
+# =================================================
 # ==============================================================================
 # Author : Vamsi Krishna S. (enterprise build)
 # Program: Territory Checks – Weekly Brand × Broker Counter (Sun→Sat)
@@ -349,9 +358,13 @@ def _internal_parse_fields(preview_text: str, full_text: str, body_html: str = "
         or _internal_kv_values(full_t, "Name")
         or _internal_kv_values(prev_t, "Name")
     )
-    name = correction_name or get_any(["Name", "Buyer Name", "Contact Name"])
+    seller_name = get_any(["Seller Name"])
+    buyer_name = get_any(["Buyer Name"])
+    name = correction_name or get_any(["Name", "Buyer Name", "Contact Name", "Seller Name"])
     if transfer_fee_subject and name_values:
         name = " | ".join(name_values)
+    elif seller_name or buyer_name:
+        name = combine_party_names(name, seller_name, buyer_name)
     released = get_any(["Released Date", "Signing Date"])
     fsc = get_any(["FSC", "Director of Franchising", "Dir of Franchising"])
     home_city_state = get_any(["Home City/State", "Home City / State", "City/State", "City / State"])
@@ -441,15 +454,46 @@ def _internal_action_announcement_type(subject: str, body_text: str = "") -> Opt
     # Prefer explicit ACTION label from body when present.
     body_label = _internal_kv_value(body_text or "", "ACTION")
     if body_label:
-        return body_label.strip()
+        # ===================== SFS_006 =====================
+        # Reason: ACTION body labels can be slightly more verbose than the
+        # canonical values we store in silver, for example
+        # "Transfer In Progress - Status Update".
+        # Normalize these labels so downstream action-date backfill and
+        # duplicate suppression keep working.
+        # ==================================================
+        bl = body_label.strip()
+        bll = bl.lower()
+        if "transfer complete" in bll:
+            return "Transfer Complete"
+        if "transfer in progress" in bll:
+            return "Transfer In Progress"
+        if "training approved" in bll and ("deal closed" in bll or "closed deal" in bll):
+            return "Training Approved/Deal Closed"
+        if "training approved" in bll:
+            return "Training Approved"
+        if "deal closed" in bll or "closed deal" in bll:
+            return "Deal Closed"
+        if "additional franchise purchase complete" in bll:
+            return "Additional Franchise Purchase Complete"
+        if "renewal complete" in bll:
+            return "Renewal Complete"
+        if "expiration of franchise agreement" in bll:
+            return "Expiration of Franchise Agreement"
+        if "termination of franchise agreement" in bll:
+            return "Termination of Franchise Agreement"
+        if "mutual termination" in bll:
+            return "Mutual Termination"
+        return bl
     sl = s.lower()
     if "transfer complete" in sl:
         return "Transfer Complete"
     if "transfer in progress" in sl:
         return "Transfer In Progress"
-    if re.search(r"training approved.*deal closed", sl):
+    if re.search(r"training approved.*(?:deal closed|closed deal)", sl):
         return "Training Approved/Deal Closed"
-    if "deal closed" in sl:
+    if "training approved" in sl:
+        return "Training Approved"
+    if "deal closed" in sl or "closed deal" in sl:
         return "Deal Closed"
     if "additional franchise purchase complete" in sl:
         return "Additional Franchise Purchase Complete"
@@ -457,6 +501,10 @@ def _internal_action_announcement_type(subject: str, body_text: str = "") -> Opt
         return "Renewal Complete"
     if "expiration of franchise agreement" in sl:
         return "Expiration of Franchise Agreement"
+    if "termination of franchise agreement" in sl:
+        return "Termination of Franchise Agreement"
+    if "mutual termination" in sl:
+        return "Mutual Termination"
     if "action" in sl:
         return s
     return None
@@ -533,46 +581,46 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
     # ACTION effective-date extractor.
     # Rule: prefer explicit business-effective dates from action templates before any fallback.
     t = str(body_text or "")
-    t = re.sub(r"[\u00A0\u2000-\u200B\u202F\u2060]", " ", t)
+    t = re.sub(r"[  -​ ⁠]", " ", t)
 
-    closed_raw = (
-        _internal_kv_value(t, "TODAY'S DATE")
-        or _internal_kv_value(t, "Today's Date")
-        or _internal_kv_value(t, "TRAINING APPROVED DATE")
-        or _internal_kv_value(t, "Training Approved Date")
-        or _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE")
-        or _internal_kv_value(t, "Date Renewal Effective Date")
-        or _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE")
-        or _internal_kv_value(t, "Date Franchise Expiration Effective")
-        or _internal_kv_value(t, "Franchise Expiration Effective Date")
-        or _internal_kv_value(t, "DATE MUTUAL TERMINATION EFFECTIVE")
-        or _internal_kv_value(t, "Date Mutual Termination Effective")
-        or _internal_kv_value(t, "Mutual Termination Effective Date")
-        or _internal_kv_value(t, "Termination Effective Date")
-        or _internal_kv_value(t, "Transfer Closing Date")
-        or _internal_kv_value(t, "Transfer Effective Date")
-        or _internal_kv_value(t, "Effective Date")
-        or _internal_kv_value(t, "Franchise Agreement-Effective Date")
-        or _internal_kv_value(t, "Closed Sale Date")
-    )
-    if not closed_raw:
-        m_term = re.search(
-            r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            t,
-        )
-        if m_term:
-            closed_raw = m_term.group(1)
-    if not closed_raw:
-        m_close = re.search(r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", t)
-        if m_close:
-            closed_raw = m_close.group(1)
-    if not closed_raw:
-        m = re.search(r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", t)
+    # ===================== SFS_007 =====================
+    # Reason: some ACTION emails contain both a valid business date and a
+    # placeholder like "TBD 2026". The older chained `or` expression could stop
+    # on a non-empty but non-parseable value and miss the valid fallback date.
+    # Try candidate fields in order and return the first one that parses.
+    # ==================================================
+    candidates = [
+        _internal_kv_value(t, "TODAY'S DATE"),
+        _internal_kv_value(t, "Today's Date"),
+        _internal_kv_value(t, "TRAINING APPROVED DATE"),
+        _internal_kv_value(t, "Training Approved Date"),
+        _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE"),
+        _internal_kv_value(t, "Date Renewal Effective Date"),
+        _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE"),
+        _internal_kv_value(t, "Date Franchise Expiration Effective"),
+        _internal_kv_value(t, "Franchise Expiration Effective Date"),
+        _internal_kv_value(t, "DATE MUTUAL TERMINATION EFFECTIVE"),
+        _internal_kv_value(t, "Date Mutual Termination Effective"),
+        _internal_kv_value(t, "Mutual Termination Effective Date"),
+        _internal_kv_value(t, "Termination Effective Date"),
+        _internal_kv_value(t, "Transfer Closing Date"),
+        _internal_kv_value(t, "Transfer Effective Date"),
+        _internal_kv_value(t, "Effective Date"),
+        _internal_kv_value(t, "Franchise Agreement-Effective Date"),
+        _internal_kv_value(t, "Closed Sale Date"),
+    ]
+    for pat in (
+        r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    ):
+        m = re.search(pat, t)
         if m:
-            closed_raw = m.group(1)
-    parsed = _internal_parse_date_any(closed_raw or "")
-    if parsed:
-        return parsed
+            candidates.append(m.group(1))
+    for raw in candidates:
+        parsed = _internal_parse_date_any(raw or "")
+        if parsed:
+            return parsed
     return None
 
 def _internal_brand_from_subject(subject: str) -> Optional[str]:
@@ -1141,7 +1189,7 @@ def is_promotional_non_territory_email(
     return promo_hits >= 2
 
 def pretty_label_from_domain(lv_email_or_domain: str) -> str:
-    lv_dom = (lv_email_or_domain or "").split("@")[-1].lower()
+    lv_dom = (lv_email_or_domain or "").split("@")[ -1].lower()
     if not lv_dom or "." not in lv_dom:
         return "Unknown"
     lv_core = lv_dom.split(".")[0]
@@ -1149,6 +1197,75 @@ def pretty_label_from_domain(lv_email_or_domain: str) -> str:
     if not lv_chunks or lv_chunks == [""]:
         return lv_core.title()
     return " ".join([lv_c.upper() if len(lv_c) <= 3 else lv_c.title() for lv_c in lv_chunks if lv_c])
+
+
+def pipe_join_distinct(*values: str) -> str:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        label = (value or "").strip()
+        if not label:
+            continue
+        norm = _norm_name(label)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(label)
+    return " | ".join(out)
+
+
+def role_label_name(name: str, role: str) -> str:
+    label = (name or "").strip()
+    if not label:
+        return ""
+    role = (role or "").strip()
+    if role and role.lower() not in label.lower():
+        return f"{label} - {role}"
+    return label
+
+
+def combine_party_names(existing: str = "", seller: str = "", buyer: str = "") -> str:
+    return pipe_join_distinct(existing, role_label_name(seller, "Seller"), role_label_name(buyer, "Buyer"))
+
+
+def prefer_richer_party_name(current: str = "", candidate: str = "") -> str:
+    cur = (current or "").strip()
+    cand = (candidate or "").strip()
+    if not cand:
+        return cur
+    if not cur:
+        return cand
+    cur_parts = [p.strip() for p in cur.split("|") if p.strip()]
+    cand_parts = [p.strip() for p in cand.split("|") if p.strip()]
+    if len(cand_parts) > len(cur_parts):
+        return cand
+    if "|" in cand and "|" not in cur:
+        return cand
+    if cand != cur and len(cand) > len(cur) + 8 and cur.lower() in cand.lower():
+        return cand
+    return cur
+
+
+def _party_match_tokens(name: str) -> List[str]:
+    tokens: List[str] = []
+    for part in str(name or "").split("|"):
+        norm = _norm_name(part)
+        norm = re.sub(r"\b(seller|buyer)\b", " ", norm)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if norm and norm not in tokens:
+            tokens.append(norm)
+    full_norm = _norm_name(name or "")
+    full_norm = re.sub(r"\b(seller|buyer)\b", " ", full_norm)
+    full_norm = re.sub(r"\s+", " ", full_norm).strip()
+    if full_norm and full_norm not in tokens:
+        tokens.append(full_norm)
+    return tokens
+
+
+def _party_names_match(left: str = "", right: str = "") -> bool:
+    left_tokens = set(_party_match_tokens(left))
+    right_tokens = set(_party_match_tokens(right))
+    return bool(left_tokens and right_tokens and left_tokens.intersection(right_tokens))
 
 # ================================ Excel Helpers ===============================
 def ensure_out_dir() -> None:
@@ -1272,39 +1389,88 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
     ]
     action_list_sql = ", ".join([f"'{x}'" for x in action_types])
 
+    # ===================== SFS_008 =====================
+    # Reason: some action-like emails can still land in silver as OTHER rows
+    # when they only contribute a closed-sale/effective date in a later run
+    # slice. In that worst case, we still want to merge them by
+    # brand + franchisee_id into the canonical financial row.
+    # ==================================================
+    action_source_sql = f"""(
+        UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({action_list_sql})
+        OR (
+          UPPER(TRIM(COALESCE(src.announcement_type, ''))) = 'OTHER'
+          AND src.closed_sale_date IS NOT NULL
+          AND src.balance_deposit_date IS NULL
+          AND src.amount_usd IS NULL
+        )
+    )"""
+    target_core_sql = f"""(
+        UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
+        AND NOT (
+          UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) = 'OTHER'
+          AND tgt.balance_deposit_date IS NULL
+          AND tgt.amount_usd IS NULL
+        )
+    )"""
+
+    # ===================== SFS_002 =====================
+    # Reason: combined transfer rows can hold multiple franchise IDs in a
+    # single silver record (for example "35505, 35644, 35780").
+    #
+    # --------------------- SFS_002 -- ---------------------
+    # Previous behavior summary:
+    # - grouped ACTION rows by brand + individual franchisee_id
+    # - then let a combined non-ACTION target row match multiple source rows
+    #   via REGEXP_CONTAINS on tgt.franchisee_id
+    # - that can make one UPDATE target row match multiple source rows and
+    #   cause the BigQuery UPDATE to fail
+    # ------------------- SFS_002 -- end -------------------
+    # +++++++++++++++++++++ SFS_002 ++ +++++++++++++++++++++
+    # Aggregate ACTION backfill fields per target raw_id so each non-ACTION
+    # row receives at most one aggregated ACTION source record.
+    # +++++++++++++++++++ SFS_002 ++ end +++++++++++++++++++
     update_sql = f"""
         UPDATE `{table_id}` AS tgt
         SET
           closed_sale_date = COALESCE(src.closed_sale_date, tgt.closed_sale_date),
           state_code = COALESCE(NULLIF(tgt.state_code, ''), src.state_code),
-          franchisee_name = COALESCE(NULLIF(tgt.franchisee_name, ''), src.franchisee_name)
+          franchisee_name = CASE
+            WHEN COALESCE(TRIM(tgt.franchisee_name), '') = '' THEN src.franchisee_name
+            WHEN COALESCE(TRIM(src.franchisee_name), '') = '' THEN tgt.franchisee_name
+            WHEN STRPOS(src.franchisee_name, '|') > 0 AND STRPOS(COALESCE(tgt.franchisee_name, ''), '|') = 0 THEN src.franchisee_name
+            WHEN LENGTH(src.franchisee_name) > LENGTH(COALESCE(tgt.franchisee_name, '')) + 8
+                 AND LOWER(src.franchisee_name) LIKE CONCAT('%', LOWER(COALESCE(tgt.franchisee_name, '')), '%') THEN src.franchisee_name
+            ELSE tgt.franchisee_name
+          END
         FROM (
           SELECT
-            brand,
-            TRIM(franchisee_id) AS franchisee_id,
-            ARRAY_AGG(franchisee_name IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
-            ARRAY_AGG(state_code IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
-            ARRAY_AGG(closed_sale_date IGNORE NULLS ORDER BY received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
-          FROM `{table_id}`
-          WHERE COALESCE(TRIM(franchisee_id), '') != ''
-            AND UPPER(TRIM(COALESCE(announcement_type, ''))) IN ({action_list_sql})
-            AND closed_sale_date IS NOT NULL
-          GROUP BY brand, TRIM(franchisee_id)
+            tgt.raw_id AS tgt_raw_id,
+            ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
+            ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
+            ARRAY_AGG(src.closed_sale_date IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
+          FROM `{table_id}` AS tgt
+          JOIN `{table_id}` AS src
+            ON tgt.brand = src.brand
+           AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
+           AND COALESCE(TRIM(src.franchisee_id), '') != ''
+           AND {target_core_sql}
+           AND {action_source_sql}
+           AND src.closed_sale_date IS NOT NULL
+           AND (
+             TRIM(tgt.franchisee_id) = TRIM(src.franchisee_id)
+             OR REGEXP_CONTAINS(TRIM(tgt.franchisee_id), CONCAT(r'(^|[^0-9])', TRIM(src.franchisee_id), r'([^0-9]|$)'))
+           )
+          GROUP BY tgt.raw_id
         ) AS src
-        WHERE tgt.brand = src.brand
-          AND COALESCE(TRIM(tgt.franchisee_id), '') != ''
-          AND (
-            TRIM(tgt.franchisee_id) = src.franchisee_id
-            OR REGEXP_CONTAINS(TRIM(tgt.franchisee_id), CONCAT(r'(^|[^0-9])', src.franchisee_id, r'([^0-9]|$)'))
-          )
-          AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
+        WHERE tgt.raw_id = src.tgt_raw_id
     """
 
     delete_sql = f"""
         DELETE FROM `{table_id}` AS src
         WHERE COALESCE(TRIM(src.franchisee_id), '') != ''
-          AND UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({action_list_sql})
+          AND {action_source_sql}
           AND src.balance_deposit_date IS NULL
+          AND src.amount_usd IS NULL
           AND EXISTS (
             SELECT 1
             FROM `{table_id}` AS tgt
@@ -1314,7 +1480,77 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
                 TRIM(tgt.franchisee_id) = TRIM(src.franchisee_id)
                 OR REGEXP_CONTAINS(TRIM(tgt.franchisee_id), CONCAT(r'(^|[^0-9])', TRIM(src.franchisee_id), r'([^0-9]|$)'))
               )
-              AND UPPER(TRIM(COALESCE(tgt.announcement_type, ''))) NOT IN ({action_list_sql})
+              AND {target_core_sql}
+          )
+    """
+
+    # ===================== SFS_010 =====================
+    # Reason: some ACTION mails do not have a usable franchisee_id in the
+    # row we want to enrich, but they still carry buyer/current-party names.
+    # Fall back to a strong brand + normalized party-name match so silver keeps
+    # one canonical financial row and only leaves unmatched actions for review.
+    # ===================================================
+    name_match_sql = """(
+      EXISTS (
+        SELECT 1
+        FROM UNNEST(SPLIT(COALESCE(src.franchisee_name, ''), '|')) AS src_name_part,
+             UNNEST(SPLIT(COALESCE(tgt.franchisee_name, ''), '|')) AS tgt_name_part
+        WHERE TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(COALESCE(src_name_part, '')), r'[^a-z0-9 ]', ' '), r'\b(seller|buyer)\b', ' ')) != ''
+          AND TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(COALESCE(src_name_part, '')), r'[^a-z0-9 ]', ' '), r'\b(seller|buyer)\b', ' ')) =
+              TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(COALESCE(tgt_name_part, '')), r'[^a-z0-9 ]', ' '), r'\b(seller|buyer)\b', ' '))
+      )
+    )"""
+
+    name_update_sql = f"""
+        UPDATE `{table_id}` AS tgt
+        SET
+          closed_sale_date = COALESCE(src.closed_sale_date, tgt.closed_sale_date),
+          state_code = COALESCE(NULLIF(tgt.state_code, ''), src.state_code),
+          franchisee_name = CASE
+            WHEN COALESCE(TRIM(tgt.franchisee_name), '') = '' THEN src.franchisee_name
+            WHEN COALESCE(TRIM(src.franchisee_name), '') = '' THEN tgt.franchisee_name
+            WHEN STRPOS(src.franchisee_name, '|') > 0 AND STRPOS(COALESCE(tgt.franchisee_name, ''), '|') = 0 THEN src.franchisee_name
+            WHEN LENGTH(src.franchisee_name) > LENGTH(COALESCE(tgt.franchisee_name, '')) + 8
+                 AND LOWER(src.franchisee_name) LIKE CONCAT('%', LOWER(COALESCE(tgt.franchisee_name, '')), '%') THEN src.franchisee_name
+            ELSE tgt.franchisee_name
+          END
+        FROM (
+          SELECT
+            tgt.raw_id AS tgt_raw_id,
+            ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
+            ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
+            ARRAY_AGG(src.closed_sale_date IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
+          FROM `{table_id}` AS tgt
+          JOIN `{table_id}` AS src
+            ON tgt.brand = src.brand
+           AND COALESCE(TRIM(src.franchisee_name), '') != ''
+           AND COALESCE(TRIM(tgt.franchisee_name), '') != ''
+           AND {target_core_sql}
+           AND {action_source_sql}
+           AND src.closed_sale_date IS NOT NULL
+           AND src.balance_deposit_date IS NULL
+           AND src.amount_usd IS NULL
+           AND (src.received_datetime IS NULL OR tgt.received_datetime IS NULL OR ABS(TIMESTAMP_DIFF(src.received_datetime, tgt.received_datetime, DAY)) <= 180)
+           AND {name_match_sql}
+          GROUP BY tgt.raw_id
+        ) AS src
+        WHERE tgt.raw_id = src.tgt_raw_id
+    """
+
+    name_delete_sql = f"""
+        DELETE FROM `{table_id}` AS src
+        WHERE COALESCE(TRIM(src.franchisee_name), '') != ''
+          AND {action_source_sql}
+          AND src.balance_deposit_date IS NULL
+          AND src.amount_usd IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM `{table_id}` AS tgt
+            WHERE tgt.brand = src.brand
+              AND COALESCE(TRIM(tgt.franchisee_name), '') != ''
+              AND {target_core_sql}
+              AND (src.received_datetime IS NULL OR tgt.received_datetime IS NULL OR ABS(TIMESTAMP_DIFF(src.received_datetime, tgt.received_datetime, DAY)) <= 180)
+              AND {name_match_sql}
           )
     """
 
@@ -1325,9 +1561,13 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
         end_dt,
     )
     upd = client.query(update_sql, location=gv_BQ_LOCATION).result()
-    gv_LOG.info("Internal silver ACTION merge updated %s rows.", upd.num_dml_affected_rows)
+    gv_LOG.info("Internal silver ACTION merge updated %s rows by franchisee_id.", upd.num_dml_affected_rows)
     dele = client.query(delete_sql, location=gv_BQ_LOCATION).result()
-    gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows.", dele.num_dml_affected_rows)
+    gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows by franchisee_id.", dele.num_dml_affected_rows)
+    name_upd = client.query(name_update_sql, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("Internal silver ACTION merge updated %s rows by franchisee_name fallback.", name_upd.num_dml_affected_rows)
+    name_dele = client.query(name_delete_sql, location=gv_BQ_LOCATION).result()
+    gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows by franchisee_name fallback.", name_dele.num_dml_affected_rows)
 
 # ============================ Path helper for GCS =============================
 def join_prefix(base_prefix: str, *parts: str) -> str:
@@ -1636,6 +1876,9 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_broker_fw   = None if lv_broker_subj else forwarded_broker_from_text(lv_body_preview)
             lv_broker_dom  = broker_from_sender(lv_msg.get("from"))
             lv_chosen_broker = lv_broker_subj or lv_broker_fw or lv_broker_dom
+            lv_forwarded_contact_email = ""
+            lv_forwarded_contact_name = ""
+            lv_forwarded_domain_label = ""
 
             def _ensure_full_text_once() -> None:
                 nonlocal lv_full_text, lv_full_html, lv_attempted_full_body_fetch, lv_fetched_full_body
@@ -1653,15 +1896,29 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     lv_full_html = None
                     lv_fetched_full_body = False
 
-            if lv_chosen_broker == "Others":
+            # ===================== SFS_003 =====================
+            # Reason: forwarded broker territory checks should preserve both the
+            # franchise brand contact and the original broker identity.
+            # ==================================================
+            lv_forwarded_candidates: List[Tuple[str, str]] = []
+            if lv_is_forward or lv_is_reply or lv_chosen_broker == "Others":
                 _ensure_full_text_once()
+                lv_forwarded_candidates = extract_forwarded_from_candidates(lv_full_text or "")
+                for cand_email, cand_name in lv_forwarded_candidates:
+                    if not cand_email or cand_email == lv_sender.strip().lower():
+                        continue
+                    lv_forwarded_contact_email = cand_email
+                    lv_forwarded_contact_name = (cand_name or "").strip()
+                    lv_forwarded_domain_label = pretty_label_from_domain(cand_email).replace(" ", "")
+                    break
+
+            if lv_chosen_broker == "Others":
                 lv_broker_full = forwarded_broker_from_text(lv_full_text or "")
                 if lv_broker_full:
                     lv_chosen_broker = lv_broker_full
 
             if lv_chosen_broker == "Others" and lv_brand in gv_BROKER_MASTER_CONFIG:
-                _ensure_full_text_once()
-                candidates = extract_forwarded_from_candidates(lv_full_text or "")
+                candidates = list(lv_forwarded_candidates)
                 if lv_sender and "@" in lv_sender:
                     candidates.append((lv_sender.strip().lower(), lv_sender_name))
 
@@ -1673,9 +1930,11 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             lv_detail_broker_label = lv_chosen_broker
             lv_others_label: Optional[str] = None
             if lv_chosen_broker == "Others":
-                lv_pretty = pretty_label_from_domain(lv_sender)
-                lv_detail_broker_label = f"Others | {lv_pretty}"
-                lv_others_label = lv_pretty
+                lv_brand_compact = re.sub(r"\s+", "", lv_brand or "UnknownBrand")
+                lv_domain_label = lv_forwarded_domain_label or pretty_label_from_domain(lv_sender).replace(" ", "")
+                lv_detail_broker_label = f"Others | {lv_brand_compact} | {lv_domain_label}"
+                lv_others_label = lv_domain_label
+            lv_broker_name_detail = pipe_join_distinct(lv_sender_name, lv_forwarded_contact_name)
 
             lv_terr = territory_from_any(lv_subj, lv_body_preview, lv_full_text)
             if not lv_terr:
@@ -1719,7 +1978,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 "Broker Brand"       : lv_detail_broker_label,
                 "Summary Bucket"     : lv_chosen_broker,
                 "Others Name"        : lv_others_label or "",
-                "Broker Name"        : lv_sender_name,
+                "Broker Name"        : lv_broker_name_detail or lv_sender_name,
                 "Territory"          : lv_terr,
                 "Received (UTC Date)": lv_recv_dt,
                 "Subject"            : lv_subj,
@@ -1844,9 +2103,11 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 #     continue
                 a_date = _internal_extract_action_date(body, r.get("received_datetime"))
                 ids = _internal_extract_action_ids(subj, body)
-                if not ids:
+                a_seller_name = _internal_kv_value(body, "Seller Name") or ""
+                a_buyer_name = _internal_kv_value(body, "Buyer Name") or _internal_kv_value(body, "Name") or ""
+                a_name = combine_party_names("", a_seller_name, a_buyer_name) or a_buyer_name or a_seller_name
+                if not ids and not a_name:
                     continue
-                a_name = _internal_kv_value(body, "Buyer Name") or _internal_kv_value(body, "Name") or ""
                 a_loc = (
                     _internal_kv_value(body, "LOCATION")
                     or _internal_kv_value(body, "Home City/State")
@@ -1855,12 +2116,26 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 )
                 a_state = _internal_state_from_city_state(a_loc or "")
                 a_brand = _internal_brand_from_subject(subj) or _safe_text(r.get("brand"))
+                if not ids:
+                    action_rows.append({
+                        "brand": a_brand,
+                        "franchisee_id": "",
+                        "franchisee_name": a_name,
+                        "announcement_type": a_type,
+                        "state_code": a_state,
+                        "closed_sale_date": a_date,
+                        "received_datetime": r.get("received_datetime"),
+                        "ingested_at": r.get("ingested_at"),
+                        "raw_id": r.get("raw_id"),
+                    })
+                    continue
                 for aid in ids:
                     aid_s = str(aid).strip()
                     action_by_id[str(aid).strip()] = {
                         "closed_sale_date": a_date,
                         "announcement_type": a_type,
                         "state_code": a_state,
+                        "franchisee_name": a_name,
                     }
                     action_rows.append({
                         "brand": a_brand,
@@ -1885,13 +2160,34 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             df_internal_final["received_datetime"] = pd.to_datetime(
                 df_internal_final["received_datetime"], errors="coerce"
             )
-            # Build merge key: franchisee_id -> franchisee_name -> raw_id
+            # ===================== SFS_005 =====================
+            # Reason: the same franchise can legitimately have multiple financial
+            # events in the same run window (for example a deposit mail and a
+            # balance mail for the same ID, or Rebecca + Jeff rows with different
+            # dates/amounts). Preserve distinct financial events while still
+            # collapsing exact duplicates and action-only residue.
+            # ==================================================
             fid = df_internal_final["franchisee_id"].fillna("").astype(str).str.strip()
             fname = df_internal_final["franchisee_name"].fillna("").astype(str).str.strip()
             rid = df_internal_final["raw_id"].fillna("").astype(str).str.strip()
-            df_internal_final["_merge_key"] = fid
-            df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = fname
-            df_internal_final.loc[df_internal_final["_merge_key"] == "", "_merge_key"] = rid
+            atype = df_internal_final["announcement_type"].fillna("").astype(str).str.strip()
+            bal_dt = df_internal_final["balance_deposit_date"].astype(str).fillna("")
+            close_dt = df_internal_final["closed_sale_date"].astype(str).fillna("")
+            amt = df_internal_final["amount_usd"].astype(str).fillna("")
+
+            base_key = fid.copy()
+            base_key.loc[base_key == ""] = fname[base_key == ""]
+            base_key.loc[base_key == ""] = rid[base_key == ""]
+
+            is_financial_event = (
+                atype.ne("")
+                & ~atype.str.upper().eq("OTHER")
+                & ~atype.apply(_is_internal_action_type)
+                & (df_internal_final["balance_deposit_date"].notna() | df_internal_final["amount_usd"].notna())
+            )
+            event_key = base_key + "|" + atype + "|" + bal_dt + "|" + close_dt + "|" + amt
+            df_internal_final["_merge_key"] = base_key
+            df_internal_final.loc[is_financial_event, "_merge_key"] = event_key[is_financial_event]
             df_internal_pre = df_internal_final.copy()
 
             def _last_non_empty(series: pd.Series):
@@ -1953,10 +2249,11 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 )
                 df_internal_final.loc[mask_replace, "announcement_type"] = preferred_series[mask_replace]
 
-            # Apply ACTION closed-sale/date mapping by franchisee_id only.
+            # Apply ACTION closed-sale/date mapping by franchisee_id first, then
+            # fall back to strong buyer/seller name matching when needed.
             # Rule: preserve template announcement_type such as DEPOSIT + BALANCE and
             # Transfer Fee Paid; use ACTION mail only for effective/closed dates and blanks.
-            if action_by_id:
+            if action_by_id or action_rows:
                 def _norm_id(v: Any) -> str:
                     if v is None:
                         return ""
@@ -1982,9 +2279,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 def _apply_action(row: pd.Series) -> pd.Series:
                     raw_ids = str(row.get("franchisee_id") or "").strip()
                     rid = _norm_id(raw_ids)
-                    if not rid and not raw_ids:
-                        return row
-                    ar = action_by_id.get(rid)
+                    ar = action_by_id.get(rid) if rid else None
                     if not ar and raw_ids:
                         multi_ids = []
                         for m in re.findall(r"\b(\d{3,})\b", raw_ids):
@@ -1996,9 +2291,39 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                 ar = action_by_id[mid]
                                 break
                     if not ar:
+                        row_brand = str(row.get("brand") or "").strip()
+                        row_name = str(row.get("franchisee_name") or "").strip()
+                        if row_name:
+                            candidates: List[dict] = []
+                            row_received = row.get("received_datetime")
+                            for candidate in action_rows:
+                                cand_name = str(candidate.get("franchisee_name") or "").strip()
+                                if not cand_name or not _party_names_match(row_name, cand_name):
+                                    continue
+                                cand_brand = str(candidate.get("brand") or "").strip()
+                                if row_brand and cand_brand and _norm(row_brand) != _norm(cand_brand):
+                                    continue
+                                cand_received = candidate.get("received_datetime")
+                                if pd.notna(row_received) and pd.notna(cand_received):
+                                    try:
+                                        if abs((pd.Timestamp(cand_received) - pd.Timestamp(row_received)).days) > 180:
+                                            continue
+                                    except Exception:
+                                        pass
+                                candidates.append(candidate)
+                            if candidates:
+                                candidates.sort(
+                                    key=lambda d: pd.Timestamp(d.get("received_datetime"))
+                                    if pd.notna(d.get("received_datetime")) else pd.Timestamp.min
+                                )
+                                ar = candidates[-1]
+                    if not ar:
                         return row
                     if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
                         row["state_code"] = ar.get("state_code")
+                    richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", ar.get("franchisee_name") or "")
+                    if not _blank(richer_name):
+                        row["franchisee_name"] = richer_name
                     # Old behavior kept action type in sync with ACTION mail when template type
                     # was blank/OTHER. We intentionally do not apply it now because template
                     # subjects like DEPOSIT + BALANCE and Transfer Fee Paid must be preserved.
@@ -2014,7 +2339,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
 
                 df_internal_final = df_internal_final.apply(_apply_action, axis=1)
 
-            # Materialize unmatched ACTION IDs as additional rows (multi-id support).
+            # Materialize unmatched ACTION rows as additional rows so unresolved
+            # items still stay visible for manual review in silver/workbook.
             existing_ids = set(
                 df_internal_final.get("franchisee_id", pd.Series([], dtype=str))
                 .astype(str).str.strip().replace("nan", "").tolist()
@@ -2023,13 +2349,42 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             for existing in list(existing_ids):
                 for m in re.findall(r"\b(\d{3,})\b", existing):
                     covered_ids.add(str(m).strip())
+
+            def _row_matches_action_target(existing_row: pd.Series, action_row: dict) -> bool:
+                existing_brand = str(existing_row.get("brand") or "").strip()
+                action_brand = str(action_row.get("brand") or "").strip()
+                if existing_brand and action_brand and _norm(existing_brand) != _norm(action_brand):
+                    return False
+                aid = str(action_row.get("franchisee_id") or "").strip()
+                existing_raw_ids = str(existing_row.get("franchisee_id") or "")
+                if aid:
+                    existing_id_tokens = {m.strip() for m in re.findall(r"\b(\d{3,})\b", existing_raw_ids)}
+                    if aid in existing_id_tokens:
+                        return True
+                action_name = str(action_row.get("franchisee_name") or "").strip()
+                existing_name = str(existing_row.get("franchisee_name") or "").strip()
+                return bool(action_name and existing_name and _party_names_match(existing_name, action_name))
+
             inserts: List[dict] = []
+            inserted_raw_ids = set(
+                df_internal_final.get("raw_id", pd.Series([], dtype=str))
+                .astype(str).str.strip().replace("nan", "").tolist()
+            )
             for ar in action_rows:
                 aid = str(ar.get("franchisee_id") or "").strip()
-                if not aid or aid in existing_ids or aid in covered_ids:
+                ar_raw = str(ar.get("raw_id") or "").strip()
+                if ar_raw and ar_raw in inserted_raw_ids:
                     continue
-                existing_ids.add(aid)
-                covered_ids.add(aid)
+                matched = any(_row_matches_action_target(ex_row, ar) for _, ex_row in df_internal_final.iterrows())
+                if matched:
+                    if ar_raw:
+                        inserted_raw_ids.add(ar_raw)
+                    continue
+                if aid:
+                    existing_ids.add(aid)
+                    covered_ids.add(aid)
+                if ar_raw:
+                    inserted_raw_ids.add(ar_raw)
                 new_row = {c: pd.NA for c in df_internal_final.columns}
                 for c in ["brand", "franchisee_id", "franchisee_name", "announcement_type", "state_code", "closed_sale_date", "received_datetime", "ingested_at", "raw_id"]:
                     if c in new_row:
@@ -2567,6 +2922,11 @@ def load_jsonl_to_bigquery(gcs_uri: str, dataset: str, table: str) -> None:
     gv_LOG.info("BigQuery JSON load complete: %d rows loaded to %s", result.output_rows, table_id)
 
 # ================================= Entrypoint =================================
+# ==================== SFS_001 ++ ====================
+# Keep main() scoped to ingestion only.
+# Do not add direct execution of downstream workbook/report scripts here.
+# Those scripts are rerun independently after silver corrections.
+# ====================================================
 def main() -> None:
     lv_parser = argparse.ArgumentParser(description="Territory Checks weekly ETL", add_help=True)
     lv_parser.add_argument(
