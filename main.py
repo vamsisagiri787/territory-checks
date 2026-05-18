@@ -545,6 +545,17 @@ def _is_internal_action_type(v: Any) -> bool:
         "MUTUAL TERMINATION",
     }
 
+
+gv_TRAINING_APPROVED_ACTION_TYPES = {
+    "TRAINING APPROVED",
+    "TRAINING APPROVED/DEAL CLOSED",
+    "TRAINING APPROVED/CLOSED DEAL",
+}
+
+
+def _is_training_approved_action_type(v: Any) -> bool:
+    return str(v or "").strip().upper() in gv_TRAINING_APPROVED_ACTION_TYPES
+
 def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
     subject_ids: List[str] = []
     seller_ids: List[str] = []
@@ -1462,6 +1473,7 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
         "MUTUAL TERMINATION",
     ]
     action_list_sql = ", ".join([f"'{x}'" for x in action_types])
+    training_action_list_sql = ", ".join([f"'{x}'" for x in sorted(gv_TRAINING_APPROVED_ACTION_TYPES)])
 
     # ===================== SFS_008 =====================
     # Reason: some action-like emails can still land in silver as OTHER rows
@@ -1521,7 +1533,16 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
             tgt.raw_id AS tgt_raw_id,
             ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
             ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
-            ARRAY_AGG(src.closed_sale_date IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
+            ARRAY_AGG(
+              src.closed_sale_date IGNORE NULLS
+              ORDER BY
+                CASE
+                  WHEN UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({training_action_list_sql}) THEN 1
+                  ELSE 0
+                END DESC,
+                src.received_datetime DESC
+              LIMIT 1
+            )[SAFE_OFFSET(0)] AS closed_sale_date
           FROM `{table_id}` AS tgt
           JOIN `{table_id}` AS src
             ON tgt.brand = src.brand
@@ -1593,7 +1614,16 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
             tgt.raw_id AS tgt_raw_id,
             ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
             ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
-            ARRAY_AGG(src.closed_sale_date IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS closed_sale_date
+            ARRAY_AGG(
+              src.closed_sale_date IGNORE NULLS
+              ORDER BY
+                CASE
+                  WHEN UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({training_action_list_sql}) THEN 1
+                  ELSE 0
+                END DESC,
+                src.received_datetime DESC
+              LIMIT 1
+            )[SAFE_OFFSET(0)] AS closed_sale_date
           FROM `{table_id}` AS tgt
           JOIN `{table_id}` AS src
             ON tgt.brand = src.brand
@@ -2373,6 +2403,14 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         pass
                     return str(v).strip() == ""
 
+                def _action_sort_key(d: dict) -> tuple[int, pd.Timestamp]:
+                    return (
+                        1 if _is_training_approved_action_type(d.get("announcement_type")) else 0,
+                        pd.Timestamp(d.get("received_datetime"))
+                        if pd.notna(d.get("received_datetime"))
+                        else pd.Timestamp.min,
+                    )
+
                 def _apply_action(row: pd.Series) -> pd.Series:
                     raw_ids = str(row.get("franchisee_id") or "").strip()
                     rid = _norm_id(raw_ids)
@@ -2396,14 +2434,15 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                 ar = action_by_id[mid]
                                 break
                     if ar:
-                        ar_raw = str(ar.get("raw_id") or "").strip()
-                        if ar_raw:
-                            matched_candidates = [c for c in action_rows if str(c.get("raw_id") or "").strip() == ar_raw]
-                        elif rid:
+                        if rid:
                             matched_candidates = [
                                 c for c in action_rows
                                 if _norm_id(c.get("franchisee_id")) == rid
                             ]
+                        if not matched_candidates:
+                            ar_raw = str(ar.get("raw_id") or "").strip()
+                            if ar_raw:
+                                matched_candidates = [c for c in action_rows if str(c.get("raw_id") or "").strip() == ar_raw]
                     if not ar:
                         row_brand = str(row.get("brand") or "").strip()
                         row_name = str(row.get("franchisee_name") or "").strip()
@@ -2426,10 +2465,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                         pass
                                 candidates.append(candidate)
                             if candidates:
-                                candidates.sort(
-                                    key=lambda d: pd.Timestamp(d.get("received_datetime"))
-                                    if pd.notna(d.get("received_datetime")) else pd.Timestamp.min
-                                )
+                                candidates.sort(key=_action_sort_key)
                                 ar = candidates[-1]
                                 matched_candidates = candidates
                                 matched_by_name = True
@@ -2451,8 +2487,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     def _latest_action_value(rows: List[dict], key: str) -> str:
                         lv_sorted = sorted(
                             rows,
-                            key=lambda d: pd.Timestamp(d.get("received_datetime"))
-                            if pd.notna(d.get("received_datetime")) else pd.Timestamp.min,
+                            key=_action_sort_key,
                         )
                         for lv_row in reversed(lv_sorted):
                             lv_val = str(lv_row.get(key) or "").strip()
