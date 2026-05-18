@@ -371,8 +371,23 @@ def _internal_parse_fields(preview_text: str, full_text: str, body_html: str = "
     state_code = _internal_state_from_city_state(home_city_state or "")
     lead_source = get_any(["Lead Source"])
     broker_details = get_any(["Broker Details", "Broker Name"])
-    if lead_source and lead_source.strip().lower() == "broker" and broker_details:
+    lead_source_norm = (lead_source or "").strip().lower()
+    broker_details_norm = (broker_details or "").strip().lower()
+    # ===================== SFS_018 =====================
+    # Reason: some brands send a non-broker lead-source label such as
+    # "Visa Franchise" while still carrying a real broker network in
+    # Broker Details (for example IFPG). Preserve that broker attribution
+    # in silver so downstream broker/organic reporting lands correctly.
+    # ===================================================
+    if lead_source and lead_source_norm == "broker" and broker_details:
         lead_source = f"Broker - {broker_details}"
+    elif (
+        lead_source
+        and lead_source_norm == "visa franchise"
+        and broker_details
+        and broker_details_norm not in {"n/a", "na", "-"}
+    ):
+        lead_source = f"Broker - {broker_details} (Visa Franchise)"
     brand_raw = get_any(["Franchise Brand", "For Company"]) or ""
     brand_code = _internal_brand_from_subject(brand_raw)
 
@@ -413,7 +428,12 @@ def _internal_announcement_type(subject: str, body_preview: str = "", body_text:
     s = (subject or "").lower()
     if "rofr" in s:
         return "ROFR"
-    if "transfer fee paid" in s:
+    # ===================== SFS_016 =====================
+    # Reason: Pet Wants and similar brands sometimes send the financial subject
+    # as "Transfer Fees Paid" (plural) for one payment that covers multiple
+    # territories. Treat singular/plural the same so we keep one canonical row.
+    # ===================================================
+    if re.search(r"\btransfer\s+fees?\s+paid\b", s):
         return "Transfer Fee Paid"
     if "territory amendment" in s:
         return "Territory Amendment"
@@ -594,6 +614,13 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
         _internal_kv_value(t, "Today's Date"),
         _internal_kv_value(t, "TRAINING APPROVED DATE"),
         _internal_kv_value(t, "Training Approved Date"),
+        # ===================== SFS_015 =====================
+        # Reason: newer TruBlue action emails label the business-close field as
+        # "TRAINING APPROVED/DEAL CLOSED DATE" instead of the older training-only
+        # key. Capture that variant so closed_sale_date backfills into silver.
+        # ===================================================
+        _internal_kv_value(t, "TRAINING APPROVED/DEAL CLOSED DATE"),
+        _internal_kv_value(t, "Training Approved/Deal Closed Date"),
         _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE"),
         _internal_kv_value(t, "Date Renewal Effective Date"),
         _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE"),
@@ -611,6 +638,7 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
     ]
     for pat in (
         r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\btraining\s+approved\s*/\s*deal\s+closed\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
     ):
@@ -1188,6 +1216,52 @@ def is_promotional_non_territory_email(
             promo_hits += 1
     return promo_hits >= 2
 
+
+def _email_domain(lv_email: str) -> str:
+    lv_email = (lv_email or "").strip().lower()
+    return lv_email.split("@")[-1] if "@" in lv_email else lv_email
+
+
+def _sender_matches_brand_domain(lv_sender: str, lv_brand: str) -> bool:
+    lv_sender_dom = _email_domain(lv_sender)
+    if not lv_sender_dom or lv_brand not in gv_BRAND_ADDRESSES:
+        return False
+    for lv_token in gv_BRAND_ADDRESSES.get(lv_brand, []):
+        lv_token = (lv_token or "").strip().lower()
+        if not lv_token:
+            continue
+        lv_token_dom = lv_token.split("@")[-1] if "@" in lv_token else lv_token
+        if lv_sender_dom == lv_token_dom or lv_sender_dom.endswith("." + lv_token_dom):
+            return True
+    return False
+
+
+# ===================== SFS_014 =====================
+# Reason: brand-side mailbox smoke tests like Angela's Pet Wants "Test"
+# mail should never land in the weekly territory board. Keep them out of
+# bronze territory counts while still allowing real broker checks through.
+# ===================================================
+def is_brand_internal_test_non_territory_email(
+    lv_sender: str,
+    lv_brand: str,
+    lv_subject: str,
+    lv_body_preview: str,
+    lv_full_body_text: str | None = None,
+    lv_territory: str = "",
+) -> bool:
+    if (lv_territory or "").strip():
+        return False
+    if not _sender_matches_brand_domain(lv_sender, lv_brand):
+        return False
+    lv_subj_norm = _norm(lv_subject or "")
+    if lv_subj_norm not in {"test", "testing", "test email", "test message"} and not re.fullmatch(r"test\s*\d*", lv_subj_norm):
+        return False
+    lv_txt = " ".join([lv_subject or "", lv_body_preview or "", lv_full_body_text or ""]).lower()
+    if any(lv_hint in lv_txt for lv_hint in ["book a call", "need a quick chat", "test"]):
+        return True
+    return True
+
+
 def pretty_label_from_domain(lv_email_or_domain: str) -> str:
     lv_dom = (lv_email_or_domain or "").split("@")[ -1].lower()
     if not lv_dom or "." not in lv_dom:
@@ -1564,10 +1638,14 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
     gv_LOG.info("Internal silver ACTION merge updated %s rows by franchisee_id.", upd.num_dml_affected_rows)
     dele = client.query(delete_sql, location=gv_BQ_LOCATION).result()
     gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows by franchisee_id.", dele.num_dml_affected_rows)
-    name_upd = client.query(name_update_sql, location=gv_BQ_LOCATION).result()
-    gv_LOG.info("Internal silver ACTION merge updated %s rows by franchisee_name fallback.", name_upd.num_dml_affected_rows)
-    name_dele = client.query(name_delete_sql, location=gv_BQ_LOCATION).result()
-    gv_LOG.info("Internal silver ACTION merge deleted %s duplicate ACTION rows by franchisee_name fallback.", name_dele.num_dml_affected_rows)
+    # ===================== SFS_011 =====================
+    # Reason: the cross-slice BigQuery name-fallback DML needs a safer rewrite.
+    # Keep the production workflow stable for now by relying on:
+    # - franchisee_id-based silver merge in BigQuery
+    # - current-run buyer/seller name fallback in pandas
+    # Historical no-ID edge cases can still be patched manually in silver.
+    # ===================================================
+    gv_LOG.info("Skipping cross-slice franchisee_name fallback DML for now; using id-based merge plus current-run name fallback only.")
 
 # ============================ Path helper for GCS =============================
 def join_prefix(base_prefix: str, *parts: str) -> str:
@@ -1836,10 +1914,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     single_id = _internal_franchisee_id_from_subject(effective_subj)
                     candidate_ids = [single_id] if single_id else [""]
                 if template_type == "Transfer Fee Paid" and len(candidate_ids) > 1:
-                    # Transfer Fee Paid carries one financial amount across multiple seller
-                    # franchise IDs. Keep that as one financial row instead of tripling the
-                    # amount into one row per ID.
-                    candidate_ids = [", ".join(dict.fromkeys([str(x).strip() for x in candidate_ids if str(x).strip()]))]
+                    # ===================== SFS_017 =====================
+                    # Reason: a single transfer-fee payment can cover multiple seller
+                    # franchise IDs/territories. Keep one silver row with all IDs joined
+                    # by a readable pipe so the amount is not duplicated per territory.
+                    # ===================================================
+                    candidate_ids = [" | ".join(dict.fromkeys([str(x).strip() for x in candidate_ids if str(x).strip()]))]
                 seen_candidate_ids: set[str] = set()
                 for candidate_id in candidate_ids:
                     cid = str(candidate_id or "").strip()
@@ -1943,6 +2023,16 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             if not lv_skipped_reason and is_promotional_non_territory_email(lv_subj, lv_body_preview, lv_full_text):
                 lv_terr = ""
                 lv_skipped_reason = "Promo / No Territory"
+            if not lv_skipped_reason and is_brand_internal_test_non_territory_email(
+                lv_sender,
+                lv_brand,
+                lv_subj,
+                lv_body_preview,
+                lv_full_text,
+                lv_terr,
+            ):
+                lv_terr = ""
+                lv_skipped_reason = "Brand Test / No Territory"
 
             lv_recv    = lv_msg.get("receivedDateTime", "")
             lv_recv_dt = lv_recv[:10] if lv_recv else ""
@@ -2121,6 +2211,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         "brand": a_brand,
                         "franchisee_id": "",
                         "franchisee_name": a_name,
+                        "seller_name": a_seller_name,
+                        "buyer_name": a_buyer_name,
                         "announcement_type": a_type,
                         "state_code": a_state,
                         "closed_sale_date": a_date,
@@ -2136,11 +2228,16 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         "announcement_type": a_type,
                         "state_code": a_state,
                         "franchisee_name": a_name,
+                        "seller_name": a_seller_name,
+                        "buyer_name": a_buyer_name,
+                        "raw_id": r.get("raw_id"),
                     }
                     action_rows.append({
                         "brand": a_brand,
                         "franchisee_id": aid_s,
                         "franchisee_name": a_name,
+                        "seller_name": a_seller_name,
+                        "buyer_name": a_buyer_name,
                         "announcement_type": a_type,
                         "state_code": a_state,
                         "closed_sale_date": a_date,
@@ -2280,9 +2377,17 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     raw_ids = str(row.get("franchisee_id") or "").strip()
                     rid = _norm_id(raw_ids)
                     ar = action_by_id.get(rid) if rid else None
+                    matched_by_name = False
+                    matched_candidates: List[dict] = []
+                    row_type = str(row.get("announcement_type") or "").strip()
+                    row_is_action_like = _is_internal_action_type(row_type) or (
+                        row_type.upper() == "OTHER"
+                        and _blank(row.get("balance_deposit_date"))
+                        and _blank(row.get("amount_usd"))
+                    )
                     if not ar and raw_ids:
                         multi_ids = []
-                        for m in re.findall(r"\b(\d{3,})\b", raw_ids):
+                        for m in re.findall(r"(\d{3,})", raw_ids):
                             mid = _norm_id(m)
                             if mid and mid not in multi_ids:
                                 multi_ids.append(mid)
@@ -2290,6 +2395,15 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                             if mid in action_by_id:
                                 ar = action_by_id[mid]
                                 break
+                    if ar:
+                        ar_raw = str(ar.get("raw_id") or "").strip()
+                        if ar_raw:
+                            matched_candidates = [c for c in action_rows if str(c.get("raw_id") or "").strip() == ar_raw]
+                        elif rid:
+                            matched_candidates = [
+                                c for c in action_rows
+                                if _norm_id(c.get("franchisee_id")) == rid
+                            ]
                     if not ar:
                         row_brand = str(row.get("brand") or "").strip()
                         row_name = str(row.get("franchisee_name") or "").strip()
@@ -2317,13 +2431,63 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                     if pd.notna(d.get("received_datetime")) else pd.Timestamp.min
                                 )
                                 ar = candidates[-1]
+                                matched_candidates = candidates
+                                matched_by_name = True
                     if not ar:
                         return row
+                    if not matched_candidates:
+                        matched_candidates = [ar]
+
+                    def _distinct_action_ids(rows: List[dict]) -> List[str]:
+                        lv_ids: List[str] = []
+                        for lv_row in rows:
+                            lv_raw = str(lv_row.get("franchisee_id") or "").strip()
+                            for lv_match in re.findall(r"(\d{3,})", lv_raw):
+                                lv_mid = _norm_id(lv_match)
+                                if lv_mid and lv_mid not in lv_ids:
+                                    lv_ids.append(lv_mid)
+                        return lv_ids
+
+                    def _latest_action_value(rows: List[dict], key: str) -> str:
+                        lv_sorted = sorted(
+                            rows,
+                            key=lambda d: pd.Timestamp(d.get("received_datetime"))
+                            if pd.notna(d.get("received_datetime")) else pd.Timestamp.min,
+                        )
+                        for lv_row in reversed(lv_sorted):
+                            lv_val = str(lv_row.get(key) or "").strip()
+                            if lv_val:
+                                return lv_val
+                        return ""
+
                     if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
                         row["state_code"] = ar.get("state_code")
-                    richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", ar.get("franchisee_name") or "")
-                    if not _blank(richer_name):
-                        row["franchisee_name"] = richer_name
+
+                    lv_action_name = _latest_action_value(matched_candidates, "franchisee_name")
+                    lv_buyer_name = _latest_action_value(matched_candidates, "buyer_name")
+                    if row_is_action_like:
+                        # ===================== SFS_012 =====================
+                        # If the row still remains a separate ACTION/manual-review row,
+                        # keep both seller and buyer names with tags so the team can map it.
+                        # Buyer-only naming is reserved for canonical financial rows that
+                        # successfully absorb the ACTION details.
+                        # ===================================================
+                        richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", lv_action_name or ar.get("franchisee_name") or "")
+                        if not _blank(richer_name):
+                            row["franchisee_name"] = richer_name
+                    else:
+                        if not _blank(lv_buyer_name):
+                            row["franchisee_name"] = lv_buyer_name
+                        else:
+                            richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", lv_action_name or ar.get("franchisee_name") or "")
+                            if not _blank(richer_name):
+                                row["franchisee_name"] = richer_name
+
+                    lv_existing_ids = [_norm_id(m) for m in re.findall(r"(\d{3,})", raw_ids) if _norm_id(m)]
+                    lv_action_ids = _distinct_action_ids(matched_candidates)
+                    if lv_action_ids and not row_is_action_like and (matched_by_name or not lv_existing_ids or len(lv_existing_ids) > 1):
+                        row["franchisee_id"] = ", ".join(lv_action_ids)
+
                     # Old behavior kept action type in sync with ACTION mail when template type
                     # was blank/OTHER. We intentionally do not apply it now because template
                     # subjects like DEPOSIT + BALANCE and Transfer Fee Paid must be preserved.
@@ -2392,6 +2556,40 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 inserts.append(new_row)
             if inserts:
                 df_internal_final = pd.concat([df_internal_final, pd.DataFrame(inserts)], ignore_index=True)
+
+            # ===================== SFS_013 =====================
+            # If an ACTION/manual-review row successfully maps to a canonical
+            # financial row in the same run, keep only the enriched financial row.
+            # Separate unresolved ACTION rows stay visible for review and retain
+            # seller|buyer tags in franchisee_name.
+            # ===================================================
+            def _is_action_review_row(row: pd.Series) -> bool:
+                lv_type = str(row.get("announcement_type") or "").strip()
+                return _is_internal_action_type(lv_type) or (
+                    lv_type.upper() == "OTHER"
+                    and _blank(row.get("amount_usd"))
+                    and _blank(row.get("balance_deposit_date"))
+                )
+
+            def _should_drop_action_row(idx: int, row: pd.Series) -> bool:
+                if not _is_action_review_row(row):
+                    return False
+                for other_idx, other in df_internal_final.iterrows():
+                    if other_idx == idx:
+                        continue
+                    if _is_action_review_row(other):
+                        continue
+                    if _row_matches_action_target(other, {
+                        "brand": row.get("brand"),
+                        "franchisee_id": row.get("franchisee_id"),
+                        "franchisee_name": row.get("franchisee_name"),
+                    }):
+                        return True
+                return False
+
+            if not df_internal_final.empty:
+                keep_mask = [not _should_drop_action_row(idx, row) for idx, row in df_internal_final.iterrows()]
+                df_internal_final = df_internal_final.loc[keep_mask].reset_index(drop=True)
 
         # Add run metadata for Silver (as ISO strings for JSONL)
         df_internal_final["run_date_from"] = lv_run_date_from.isoformat()

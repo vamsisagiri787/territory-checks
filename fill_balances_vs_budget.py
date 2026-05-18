@@ -295,13 +295,55 @@ def restore_logos(wb: xl.Workbook) -> None:
         print(f"[INFO] {sheet_name}: reinserted logos={added}")
 
 
-def apply_month_visibility(ws: xl.worksheet.worksheet.Worksheet, counts: dict[tuple[str, str, int], int]) -> None:
+def apply_month_visibility(ws: xl.worksheet.worksheet.Worksheet, counts: dict[tuple[str, str, int], int]) -> int:
     populated_months = {m for (_, _, m), _v in counts.items() if 1 <= m <= 12}
     latest = max(populated_months) if populated_months else 1
     for m in range(1, 13):
         col_letter = get_column_letter(month_col(m))
         ws.column_dimensions[col_letter].hidden = m > latest
     print(f"[INFO] {ws.title}: showing months 1..{latest}, hiding {latest + 1}..12")
+    return latest
+
+
+def apply_rollup_formulas(
+    ws: xl.worksheet.worksheet.Worksheet,
+    latest_month: int,
+    prior_year_sheet_name: str | None = None,
+) -> None:
+    # ===================== SFS_010 =====================
+    # Reason: the visible comparison columns on this workbook are YTD-style:
+    # current-year total through the latest visible month, prior-year total
+    # through that same cutoff, and change between them. The template can keep
+    # stale full-year/static values, so rebuild the brand-level formulas here.
+    # ====================================================
+    latest_month = max(1, min(12, int(latest_month or 1)))
+    latest_month_col = get_column_letter(month_col(latest_month))
+
+    actual_rows = sorted(ROW_MAP["ORGANIC"].values()) + sorted(ROW_MAP["BROKER"].values())
+    budget_rows = [r + 1 for r in actual_rows]
+    all_value_rows = actual_rows + budget_rows
+
+    current_total_col = 16  # P
+    prior_total_col = 25    # Y
+    ytd_change_col = 26     # Z
+
+    if prior_year_sheet_name and prior_year_sheet_name in ws.parent.sheetnames:
+        for row in all_value_rows:
+            ws.cell(row=row, column=current_total_col, value=f"=SUM(D{row}:{latest_month_col}{row})")
+            ws.cell(row=row, column=prior_total_col, value=f"='{prior_year_sheet_name}'!P{row}")
+            ws.cell(row=row, column=ytd_change_col, value=f"=P{row}-Y{row}")
+    else:
+        for row in all_value_rows:
+            ws.cell(row=row, column=current_total_col, value=f"=SUM(D{row}:{latest_month_col}{row})")
+            existing_prior = ws.cell(row=row, column=prior_total_col).value
+            if existing_prior is not None:
+                ws.cell(row=row, column=prior_total_col, value=existing_prior)
+            ws.cell(row=row, column=ytd_change_col, value=f"=P{row}-Y{row}")
+
+    print(
+        f"[INFO] {ws.title}: rebuilt YTD rollups through month={latest_month}"
+        + (f" using prior sheet {prior_year_sheet_name}" if prior_year_sheet_name else "")
+    )
 
 
 def main() -> None:
@@ -317,7 +359,15 @@ def main() -> None:
 
     print("[INFO] Writing ACTUAL cells (ORGANIC/BROKER)...")
     write_actuals(ws, counts)
-    apply_month_visibility(ws, counts)
+    latest_month = apply_month_visibility(ws, counts)
+    apply_rollup_formulas(ws, latest_month, prior_year_sheet_name=f"{TARGET_YEAR - 1} BALANCES REPORT")
+
+    prior_sheet_name = f"{TARGET_YEAR - 1} BALANCES REPORT"
+    if prior_sheet_name in wb.sheetnames:
+        prior_ws = wb[prior_sheet_name]
+        apply_month_visibility(prior_ws, counts)
+        apply_rollup_formulas(prior_ws, latest_month)
+
     restore_logos(wb)
 
     out_name = f"balances_vs_budget_{TARGET_YEAR}_{datetime.utcnow():%Y-%m-%d}.xlsx"
