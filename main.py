@@ -553,8 +553,17 @@ gv_TRAINING_APPROVED_ACTION_TYPES = {
 }
 
 
+gv_CLOSED_SALE_ACTION_TYPES = set(gv_TRAINING_APPROVED_ACTION_TYPES) | {
+    "DEAL CLOSED",
+}
+
+
 def _is_training_approved_action_type(v: Any) -> bool:
     return str(v or "").strip().upper() in gv_TRAINING_APPROVED_ACTION_TYPES
+
+
+def _is_closed_sale_action_type(v: Any) -> bool:
+    return str(v or "").strip().upper() in gv_CLOSED_SALE_ACTION_TYPES
 
 def _internal_extract_action_ids(subject: str, body_text: str) -> List[str]:
     subject_ids: List[str] = []
@@ -632,6 +641,13 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
         # ===================================================
         _internal_kv_value(t, "TRAINING APPROVED/DEAL CLOSED DATE"),
         _internal_kv_value(t, "Training Approved/Deal Closed Date"),
+        # ===================== SFS_019 =====================
+        # Reason: some TruBlue closed-deal mails use the direct label
+        # "DEAL CLOSED DATE". Treat that as the same business close field so the
+        # latest Closed Deal action updates silver.
+        # ===================================================
+        _internal_kv_value(t, "DEAL CLOSED DATE"),
+        _internal_kv_value(t, "Deal Closed Date"),
         _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE"),
         _internal_kv_value(t, "Date Renewal Effective Date"),
         _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE"),
@@ -650,6 +666,7 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
     for pat in (
         r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btraining\s+approved\s*/\s*deal\s+closed\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\bdeal\s+closed\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
     ):
@@ -1473,7 +1490,7 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
         "MUTUAL TERMINATION",
     ]
     action_list_sql = ", ".join([f"'{x}'" for x in action_types])
-    training_action_list_sql = ", ".join([f"'{x}'" for x in sorted(gv_TRAINING_APPROVED_ACTION_TYPES)])
+    closed_sale_action_list_sql = ", ".join([f"'{x}'" for x in sorted(gv_CLOSED_SALE_ACTION_TYPES)])
 
     # ===================== SFS_008 =====================
     # Reason: some action-like emails can still land in silver as OTHER rows
@@ -1534,13 +1551,12 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
             ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
             ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
             ARRAY_AGG(
-              src.closed_sale_date IGNORE NULLS
-              ORDER BY
-                CASE
-                  WHEN UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({training_action_list_sql}) THEN 1
-                  ELSE 0
-                END DESC,
-                src.received_datetime DESC
+              IF(
+                UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({closed_sale_action_list_sql}),
+                src.closed_sale_date,
+                NULL
+              ) IGNORE NULLS
+              ORDER BY src.received_datetime DESC
               LIMIT 1
             )[SAFE_OFFSET(0)] AS closed_sale_date
           FROM `{table_id}` AS tgt
@@ -1615,13 +1631,12 @@ def merge_internal_action_rows_into_silver(start_dt: datetime, end_dt: datetime)
             ARRAY_AGG(src.franchisee_name IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS franchisee_name,
             ARRAY_AGG(src.state_code IGNORE NULLS ORDER BY src.received_datetime DESC LIMIT 1)[SAFE_OFFSET(0)] AS state_code,
             ARRAY_AGG(
-              src.closed_sale_date IGNORE NULLS
-              ORDER BY
-                CASE
-                  WHEN UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({training_action_list_sql}) THEN 1
-                  ELSE 0
-                END DESC,
-                src.received_datetime DESC
+              IF(
+                UPPER(TRIM(COALESCE(src.announcement_type, ''))) IN ({closed_sale_action_list_sql}),
+                src.closed_sale_date,
+                NULL
+              ) IGNORE NULLS
+              ORDER BY src.received_datetime DESC
               LIMIT 1
             )[SAFE_OFFSET(0)] AS closed_sale_date
           FROM `{table_id}` AS tgt
@@ -2495,6 +2510,20 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                 return lv_val
                         return ""
 
+                    def _latest_closed_sale_date(rows: List[dict]) -> str:
+                        lv_sorted = sorted(
+                            rows,
+                            key=lambda d: pd.Timestamp(d.get("received_datetime"))
+                            if pd.notna(d.get("received_datetime")) else pd.Timestamp.min,
+                        )
+                        for lv_row in reversed(lv_sorted):
+                            if not _is_closed_sale_action_type(lv_row.get("announcement_type")):
+                                continue
+                            lv_val = str(lv_row.get("closed_sale_date") or "").strip()
+                            if lv_val:
+                                return lv_val
+                        return ""
+
                     if _blank(row.get("state_code")) and not _blank(ar.get("state_code")):
                         row["state_code"] = ar.get("state_code")
 
@@ -2531,9 +2560,14 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     # ar_t = str(ar.get("announcement_type") or "").strip()
                     # if at in {"", "OTHER"} and ar_t:
                     #     row["announcement_type"] = ar_t
-                    # For mapped ACTION rows, always carry latest closed date when present.
-                    if not _blank(ar.get("closed_sale_date")):
-                        row["closed_sale_date"] = ar.get("closed_sale_date")
+                    # ===================== SFS_020 =====================
+                    # Rule: only true close signals should populate closed_sale_date.
+                    # Transfer-in-progress/status-update mails can help with names/IDs,
+                    # but they should not move the financial row into an earlier month.
+                    # ===================================================
+                    lv_closed_sale_date = _latest_closed_sale_date(matched_candidates)
+                    if not _blank(lv_closed_sale_date):
+                        row["closed_sale_date"] = lv_closed_sale_date
                     return row
 
                 df_internal_final = df_internal_final.apply(_apply_action, axis=1)
