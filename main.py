@@ -428,12 +428,13 @@ def _internal_announcement_type(subject: str, body_preview: str = "", body_text:
     s = (subject or "").lower()
     if "rofr" in s:
         return "ROFR"
-    # ===================== SFS_016 =====================
-    # Reason: Pet Wants and similar brands sometimes send the financial subject
-    # as "Transfer Fees Paid" (plural) for one payment that covers multiple
-    # territories. Treat singular/plural the same so we keep one canonical row.
+    # ===================== SFS_021 =====================
+    # Reason: brands can phrase the same transfer-fee payment subject as
+    # "Transfer Fee Paid", "Transfer Fees Paid", or "Transfer Fee Received".
+    # Normalize all of them to one canonical type so the multi-ID combine
+    # rule keeps a single silver row instead of splitting the amount per ID.
     # ===================================================
-    if re.search(r"\btransfer\s+fees?\s+paid\b", s):
+    if re.search(r"\btransfer\s+fees?\s+(?:paid|received)\b", s):
         return "Transfer Fee Paid"
     if "territory amendment" in s:
         return "Territory Amendment"
