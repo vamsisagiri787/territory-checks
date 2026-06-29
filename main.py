@@ -636,19 +636,24 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
         _internal_kv_value(t, "TRAINING APPROVED DATE"),
         _internal_kv_value(t, "Training Approved Date"),
         # ===================== SFS_015 =====================
-        # Reason: newer TruBlue action emails label the business-close field as
-        # "TRAINING APPROVED/DEAL CLOSED DATE" instead of the older training-only
-        # key. Capture that variant so closed_sale_date backfills into silver.
+        # Reason: newer action emails can phrase the business-close field in either
+        # word order, for example "TRAINING APPROVED/DEAL CLOSED DATE" or
+        # "TRAINING APPROVED/CLOSED DEAL DATE". Capture both so closed_sale_date
+        # backfills into silver regardless of template wording.
         # ===================================================
         _internal_kv_value(t, "TRAINING APPROVED/DEAL CLOSED DATE"),
         _internal_kv_value(t, "Training Approved/Deal Closed Date"),
+        _internal_kv_value(t, "TRAINING APPROVED/CLOSED DEAL DATE"),
+        _internal_kv_value(t, "Training Approved/Closed Deal Date"),
         # ===================== SFS_019 =====================
-        # Reason: some TruBlue closed-deal mails use the direct label
-        # "DEAL CLOSED DATE". Treat that as the same business close field so the
-        # latest Closed Deal action updates silver.
+        # Reason: some action emails also use the shorter direct labels
+        # "DEAL CLOSED DATE" or "CLOSED DEAL DATE". Treat both as the same
+        # business close field so the latest close signal updates silver.
         # ===================================================
         _internal_kv_value(t, "DEAL CLOSED DATE"),
         _internal_kv_value(t, "Deal Closed Date"),
+        _internal_kv_value(t, "CLOSED DEAL DATE"),
+        _internal_kv_value(t, "Closed Deal Date"),
         _internal_kv_value(t, "DATE RENEWAL EFFECTIVE DATE"),
         _internal_kv_value(t, "Date Renewal Effective Date"),
         _internal_kv_value(t, "DATE FRANCHISE EXPIRATION EFFECTIVE"),
@@ -667,7 +672,9 @@ def _internal_extract_action_date(body_text: str, received_datetime: Any) -> Opt
     for pat in (
         r"(?im)\bdate\s+mutual\s+termination\s+effective\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btraining\s+approved\s*/\s*deal\s+closed\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\btraining\s+approved\s*/\s*closed\s+deal\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\bdeal\s+closed\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?im)\bclosed\s+deal\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+closing\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         r"(?im)\btransfer\s+effective\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
     ):
@@ -1352,11 +1359,26 @@ def prefer_richer_party_name(current: str = "", candidate: str = "") -> str:
 def _party_match_tokens(name: str) -> List[str]:
     tokens: List[str] = []
     for part in str(name or "").split("|"):
-        norm = _norm_name(part)
+        raw_part = str(part or "").strip()
+        norm = _norm_name(raw_part)
         norm = re.sub(r"\b(seller|buyer)\b", " ", norm)
         norm = re.sub(r"\s+", " ", norm).strip()
         if norm and norm not in tokens:
             tokens.append(norm)
+
+        # ===================== SFS_023 =====================
+        # Reason: financial rows often join buyer names with separators like
+        # "&" or "and", while action rows store each party separately. Add
+        # clean multi-word sub-party tokens so transfer rows can inherit the
+        # correct seller/buyer territory ID in later backfill logic.
+        # ===================================================
+        for piece in re.split(r"(?i)\s*(?:&|and)\s*", raw_part):
+            piece_norm = _norm_name(piece)
+            piece_norm = re.sub(r"\b(seller|buyer)\b", " ", piece_norm)
+            piece_norm = re.sub(r"\s+", " ", piece_norm).strip()
+            if piece_norm and " " in piece_norm and piece_norm not in tokens:
+                tokens.append(piece_norm)
+
     full_norm = _norm_name(name or "")
     full_norm = re.sub(r"\b(seller|buyer)\b", " ", full_norm)
     full_norm = re.sub(r"\s+", " ", full_norm).strip()
@@ -2552,15 +2574,16 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     lv_action_ids = _distinct_action_ids(matched_candidates)
                     if lv_action_ids and not row_is_action_like and (matched_by_name or not lv_existing_ids or len(lv_existing_ids) > 1):
                         row["franchisee_id"] = ", ".join(lv_action_ids)
+                    # ===================== SFS_022 =====================
+                    # Rule: preserve template announcement_type for financial rows such as
+                    # DEPOSIT + BALANCE or Transfer Fee Paid, but let action-only/manual-review
+                    # rows keep their normalized ACTION type instead of lingering as OTHER.
+                    # That makes downstream workbook suppression and manual review clearer.
+                    # ===================================================
+                    lv_action_type = _latest_action_value(matched_candidates, "announcement_type")
+                    if row_is_action_like and not _blank(lv_action_type):
+                        row["announcement_type"] = lv_action_type
 
-                    # Old behavior kept action type in sync with ACTION mail when template type
-                    # was blank/OTHER. We intentionally do not apply it now because template
-                    # subjects like DEPOSIT + BALANCE and Transfer Fee Paid must be preserved.
-                    #
-                    # at = str(row.get("announcement_type") or "").strip().upper()
-                    # ar_t = str(ar.get("announcement_type") or "").strip()
-                    # if at in {"", "OTHER"} and ar_t:
-                    #     row["announcement_type"] = ar_t
                     # ===================== SFS_020 =====================
                     # Rule: only true close signals should populate closed_sale_date.
                     # Transfer-in-progress/status-update mails can help with names/IDs,
@@ -3226,3 +3249,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
