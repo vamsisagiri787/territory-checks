@@ -2431,6 +2431,16 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     m = re.fullmatch(r"(\d+)\.0+", s)
                     return m.group(1) if m else s
 
+                def _safe_text(v: Any) -> str:
+                    if v is None:
+                        return ""
+                    try:
+                        if pd.isna(v):
+                            return ""
+                    except Exception:
+                        pass
+                    return str(v).strip()
+
                 def _blank(v: Any) -> bool:
                     if v is None:
                         return True
@@ -2450,12 +2460,12 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     )
 
                 def _apply_action(row: pd.Series) -> pd.Series:
-                    raw_ids = str(row.get("franchisee_id") or "").strip()
+                    raw_ids = _safe_text(row.get("franchisee_id"))
                     rid = _norm_id(raw_ids)
                     ar = action_by_id.get(rid) if rid else None
                     matched_by_name = False
                     matched_candidates: List[dict] = []
-                    row_type = str(row.get("announcement_type") or "").strip()
+                    row_type = _safe_text(row.get("announcement_type"))
                     row_is_action_like = _is_internal_action_type(row_type) or (
                         row_type.upper() == "OTHER"
                         and _blank(row.get("balance_deposit_date"))
@@ -2478,20 +2488,20 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                                 if _norm_id(c.get("franchisee_id")) == rid
                             ]
                         if not matched_candidates:
-                            ar_raw = str(ar.get("raw_id") or "").strip()
+                            ar_raw = _safe_text(ar.get("raw_id"))
                             if ar_raw:
-                                matched_candidates = [c for c in action_rows if str(c.get("raw_id") or "").strip() == ar_raw]
+                                matched_candidates = [c for c in action_rows if _safe_text(c.get("raw_id")) == ar_raw]
                     if not ar:
-                        row_brand = str(row.get("brand") or "").strip()
-                        row_name = str(row.get("franchisee_name") or "").strip()
+                        row_brand = _safe_text(row.get("brand"))
+                        row_name = _safe_text(row.get("franchisee_name"))
                         if row_name:
                             candidates: List[dict] = []
                             row_received = row.get("received_datetime")
                             for candidate in action_rows:
-                                cand_name = str(candidate.get("franchisee_name") or "").strip()
+                                cand_name = _safe_text(candidate.get("franchisee_name"))
                                 if not cand_name or not _party_names_match(row_name, cand_name):
                                     continue
-                                cand_brand = str(candidate.get("brand") or "").strip()
+                                cand_brand = _safe_text(candidate.get("brand"))
                                 if row_brand and cand_brand and _norm(row_brand) != _norm(cand_brand):
                                     continue
                                 cand_received = candidate.get("received_datetime")
@@ -2515,7 +2525,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     def _distinct_action_ids(rows: List[dict]) -> List[str]:
                         lv_ids: List[str] = []
                         for lv_row in rows:
-                            lv_raw = str(lv_row.get("franchisee_id") or "").strip()
+                            lv_raw = _safe_text(lv_row.get("franchisee_id"))
                             for lv_match in re.findall(r"(\d{3,})", lv_raw):
                                 lv_mid = _norm_id(lv_match)
                                 if lv_mid and lv_mid not in lv_ids:
@@ -2528,7 +2538,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                             key=_action_sort_key,
                         )
                         for lv_row in reversed(lv_sorted):
-                            lv_val = str(lv_row.get(key) or "").strip()
+                            lv_val = _safe_text(lv_row.get(key))
                             if lv_val:
                                 return lv_val
                         return ""
@@ -2542,7 +2552,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         for lv_row in reversed(lv_sorted):
                             if not _is_closed_sale_action_type(lv_row.get("announcement_type")):
                                 continue
-                            lv_val = str(lv_row.get("closed_sale_date") or "").strip()
+                            lv_val = _safe_text(lv_row.get("closed_sale_date"))
                             if lv_val:
                                 return lv_val
                         return ""
@@ -2559,14 +2569,14 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                         # Buyer-only naming is reserved for canonical financial rows that
                         # successfully absorb the ACTION details.
                         # ===================================================
-                        richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", lv_action_name or ar.get("franchisee_name") or "")
+                        richer_name = prefer_richer_party_name(_safe_text(row.get("franchisee_name")), lv_action_name or _safe_text(ar.get("franchisee_name")))
                         if not _blank(richer_name):
                             row["franchisee_name"] = richer_name
                     else:
                         if not _blank(lv_buyer_name):
                             row["franchisee_name"] = lv_buyer_name
                         else:
-                            richer_name = prefer_richer_party_name(row.get("franchisee_name") or "", lv_action_name or ar.get("franchisee_name") or "")
+                            richer_name = prefer_richer_party_name(_safe_text(row.get("franchisee_name")), lv_action_name or _safe_text(ar.get("franchisee_name")))
                             if not _blank(richer_name):
                                 row["franchisee_name"] = richer_name
 
@@ -2608,18 +2618,18 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     covered_ids.add(str(m).strip())
 
             def _row_matches_action_target(existing_row: pd.Series, action_row: dict) -> bool:
-                existing_brand = str(existing_row.get("brand") or "").strip()
-                action_brand = str(action_row.get("brand") or "").strip()
+                existing_brand = _safe_text(existing_row.get("brand"))
+                action_brand = _safe_text(action_row.get("brand"))
                 if existing_brand and action_brand and _norm(existing_brand) != _norm(action_brand):
                     return False
-                aid = str(action_row.get("franchisee_id") or "").strip()
-                existing_raw_ids = str(existing_row.get("franchisee_id") or "")
+                aid = _safe_text(action_row.get("franchisee_id"))
+                existing_raw_ids = _safe_text(existing_row.get("franchisee_id"))
                 if aid:
                     existing_id_tokens = {m.strip() for m in re.findall(r"\b(\d{3,})\b", existing_raw_ids)}
                     if aid in existing_id_tokens:
                         return True
-                action_name = str(action_row.get("franchisee_name") or "").strip()
-                existing_name = str(existing_row.get("franchisee_name") or "").strip()
+                action_name = _safe_text(action_row.get("franchisee_name"))
+                existing_name = _safe_text(existing_row.get("franchisee_name"))
                 return bool(action_name and existing_name and _party_names_match(existing_name, action_name))
 
             inserts: List[dict] = []
@@ -2628,8 +2638,8 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                 .astype(str).str.strip().replace("nan", "").tolist()
             )
             for ar in action_rows:
-                aid = str(ar.get("franchisee_id") or "").strip()
-                ar_raw = str(ar.get("raw_id") or "").strip()
+                aid = _safe_text(ar.get("franchisee_id"))
+                ar_raw = _safe_text(ar.get("raw_id"))
                 if ar_raw and ar_raw in inserted_raw_ids:
                     continue
                 matched = any(_row_matches_action_target(ex_row, ar) for _, ex_row in df_internal_final.iterrows())
@@ -2657,7 +2667,7 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
             # seller|buyer tags in franchisee_name.
             # ===================================================
             def _is_action_review_row(row: pd.Series) -> bool:
-                lv_type = str(row.get("announcement_type") or "").strip()
+                lv_type = "" if _blank(row.get("announcement_type")) else str(row.get("announcement_type")).strip()
                 return _is_internal_action_type(lv_type) or (
                     lv_type.upper() == "OTHER"
                     and _blank(row.get("amount_usd"))
