@@ -2431,16 +2431,6 @@ def run(lv_override_week_end_str: Optional[str] = None) -> dict:
                     m = re.fullmatch(r"(\d+)\.0+", s)
                     return m.group(1) if m else s
 
-                def _safe_text(v: Any) -> str:
-                    if v is None:
-                        return ""
-                    try:
-                        if pd.isna(v):
-                            return ""
-                    except Exception:
-                        pass
-                    return str(v).strip()
-
                 def _blank(v: Any) -> bool:
                     if v is None:
                         return True
